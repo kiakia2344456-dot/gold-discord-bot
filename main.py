@@ -1,23 +1,23 @@
-print("TEST MAIN.PY STARTED", flush=True)
 import os
-import re
 import json
 import asyncio
-import requests
 import math
-from html import unescape
+import statistics
 from datetime import datetime, timedelta, timezone
 
+import requests
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-
 from aiohttp import web
+
+
+# =========================================================
+# DEBUG
+# =========================================================
+
+print("🔥🔥🔥 GOLD TRADING BOT - MAIN.PY STARTED 🔥🔥🔥", flush=True)
 
 
 # =========================================================
@@ -26,58 +26,26 @@ from aiohttp import web
 
 TZ = timezone(timedelta(hours=7))
 
-HISTORY_FILE = "gold_history.json"
-HISTORY_KEEP_DAYS = 45
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Discord Alert Channel
 ALERT_CHANNEL_ID = int(
-    os.getenv("ALERT_CHANNEL_ID", "1538158164522827888")
+    os.getenv("ALERT_CHANNEL_ID", "0")
 )
 
-# แจ้งเตือนเมื่อราคาทอง Spot เปลี่ยนจากราคาที่แจ้งครั้งล่าสุด
-ALERT_THRESHOLD = float(
-    os.getenv("ALERT_THRESHOLD", "3.0")
-)
-
-# วิเคราะห์ทุกกี่นาที
-CHECK_INTERVAL_MINUTES = 1
-
-# สัญลักษณ์ Yahoo Finance
+# Yahoo Finance symbol
 XAU_SYMBOL = "XAUUSD=X"
-USDTHB_SYMBOL = "USDTHB=X"
 
-# Timeframes สำหรับการวิเคราะห์
-TIMEFRAMES = {
-    "5m": {
-        "interval": "5m",
-        "range": "5d"
-    },
-    "15m": {
-        "interval": "15m",
-        "range": "5d"
-    },
-    "1h": {
-        "interval": "1h",
-        "range": "30d"
-    },
-    "4h": {
-        "interval": "1h",
-        "range": "90d"
-    },
-    "1d": {
-        "interval": "1d",
-        "range": "1y"
-    }
-}
+# เก็บข้อมูลในไฟล์
+HISTORY_FILE = "xau_history.json"
 
+# polling ทุก 5 นาที
+CHECK_INTERVAL_MINUTES = 5
 
-# =========================================================
-# GLOBAL
-# =========================================================
+# แจ้งเตือนซ้ำอย่างน้อยกี่นาที
+ALERT_COOLDOWN_MINUTES = 30
 
-last_alert_price = None
-last_trend_alert = None
-last_breakout_state = None
+# คะแนนขั้นต่ำสำหรับ Alert
+ALERT_SCORE = 6
 
 
 # =========================================================
@@ -94,7 +62,7 @@ bot = commands.Bot(
 
 
 # =========================================================
-# WEB SERVER
+# WEB SERVER FOR RENDER
 # =========================================================
 
 async def handle_health_check(request):
@@ -108,8 +76,15 @@ async def start_web_server():
 
     app = web.Application()
 
-    app.router.add_get("/", handle_health_check)
-    app.router.add_get("/health", handle_health_check)
+    app.router.add_get(
+        "/",
+        handle_health_check
+    )
+
+    app.router.add_get(
+        "/health",
+        handle_health_check
+    )
 
     runner = web.AppRunner(app)
 
@@ -128,7 +103,8 @@ async def start_web_server():
     await site.start()
 
     print(
-        f"Web server active on port {port}"
+        f"🌐 Web server active on port {port}",
+        flush=True
     )
 
 
@@ -136,221 +112,181 @@ async def start_web_server():
 # HTTP SESSION
 # =========================================================
 
-HEADERS = {
+SESSION = requests.Session()
+
+SESSION.headers.update({
     "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
-}
+        "Chrome/120 Safari/537.36"
+})
 
 
-def yahoo_chart_url(
+# =========================================================
+# YAHOO FINANCE DATA
+# =========================================================
+
+def yahoo_chart(
     symbol,
     interval="5m",
     range_value="5d"
 ):
 
-    return (
+    url = (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{symbol}"
-        f"?range={range_value}"
-        f"&interval={interval}"
-        "&includePrePost=true"
-        "&events=div%2Csplits"
+        + symbol
     )
 
+    params = {
+        "interval": interval,
+        "range": range_value,
+        "includePrePost": "true",
+        "events": "div,splits"
+    }
 
-# =========================================================
-# FETCH YAHOO FINANCE
-# =========================================================
-
-def fetch_yahoo_data(
-    symbol,
-    interval="5m",
-    range_value="5d"
-):
-
-    url = yahoo_chart_url(
-        symbol,
-        interval,
-        range_value
-    )
-
-    response = requests.get(
+    response = SESSION.get(
         url,
-        headers=HEADERS,
-        timeout=15
+        params=params,
+        timeout=20
     )
 
     response.raise_for_status()
 
     data = response.json()
 
-    result = data["chart"]["result"]
+    result = data.get("chart", {}).get("result")
 
     if not result:
         raise ValueError(
-            f"No Yahoo data for {symbol}"
+            f"Yahoo ไม่ส่งข้อมูล {symbol}"
         )
 
-    result = result[0]
+    return result[0]
 
-    timestamps = result.get(
-        "timestamp",
-        []
+
+def get_candles(
+    interval="5m",
+    range_value="5d"
+):
+
+    data = yahoo_chart(
+        XAU_SYMBOL,
+        interval,
+        range_value
     )
 
-    indicators = result[
-        "indicators"
-    ]["quote"][0]
+    timestamps = data.get("timestamp", [])
 
-    opens = indicators.get(
-        "open",
-        []
+    quote = (
+        data.get("indicators", {})
+        .get("quote", [{}])[0]
     )
 
-    highs = indicators.get(
-        "high",
-        []
-    )
+    opens = quote.get("open", [])
+    highs = quote.get("high", [])
+    lows = quote.get("low", [])
+    closes = quote.get("close", [])
+    volumes = quote.get("volume", [])
 
-    lows = indicators.get(
-        "low",
-        []
-    )
+    candles = []
 
-    closes = indicators.get(
-        "close",
-        []
-    )
-
-    volumes = indicators.get(
-        "volume",
-        []
-    )
-
-    rows = []
-
-    for i, timestamp in enumerate(
-        timestamps
-    ):
+    for i, ts in enumerate(timestamps):
 
         try:
 
-            close = closes[i]
+            o = opens[i]
+            h = highs[i]
+            l = lows[i]
+            c = closes[i]
 
-            if close is None:
+            if (
+                o is None
+                or h is None
+                or l is None
+                or c is None
+            ):
                 continue
 
-            rows.append({
-                "timestamp": datetime.fromtimestamp(
-                    timestamp,
+            volume = (
+                volumes[i]
+                if i < len(volumes)
+                and volumes[i] is not None
+                else 0
+            )
+
+            candles.append({
+                "timestamp": int(ts),
+                "datetime": datetime.fromtimestamp(
+                    ts,
                     timezone.utc
-                ).astimezone(TZ).isoformat(),
+                ).astimezone(TZ),
 
-                "open": (
-                    float(opens[i])
-                    if opens[i] is not None
-                    else float(close)
-                ),
-
-                "high": (
-                    float(highs[i])
-                    if highs[i] is not None
-                    else float(close)
-                ),
-
-                "low": (
-                    float(lows[i])
-                    if lows[i] is not None
-                    else float(close)
-                ),
-
-                "close": float(close),
-
-                "volume": (
-                    float(volumes[i])
-                    if i < len(volumes)
-                    and volumes[i] is not None
-                    else 0
-                )
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": float(volume)
             })
 
-        except Exception:
+        except (
+            IndexError,
+            TypeError,
+            ValueError
+        ):
             continue
 
-    if not rows:
-        raise ValueError(
-            f"No usable data for {symbol}"
-        )
-
-    return rows
+    return candles
 
 
 # =========================================================
-# GET CURRENT GOLD
+# CURRENT PRICE
 # =========================================================
 
-def get_gold_market():
+def get_current_price():
 
-    data = fetch_yahoo_data(
+    data = yahoo_chart(
         XAU_SYMBOL,
-        "5m",
-        "5d"
+        interval="5m",
+        range_value="1d"
     )
 
-    latest = data[-1]
+    meta = data.get("meta", {})
+
+    price = meta.get(
+        "regularMarketPrice"
+    )
+
+    if price is None:
+
+        candles = get_candles(
+            "5m",
+            "1d"
+        )
+
+        if not candles:
+            raise ValueError(
+                "ไม่พบราคาปัจจุบัน"
+            )
+
+        price = candles[-1]["close"]
+
+    previous = meta.get(
+        "previousClose"
+    )
 
     return {
-        "price": latest["close"],
-        "open": latest["open"],
-        "high": latest["high"],
-        "low": latest["low"],
-        "timestamp": latest["timestamp"]
+        "price": float(price),
+        "previous": (
+            float(previous)
+            if previous is not None
+            else None
+        ),
+        "currency": meta.get(
+            "currency",
+            "USD"
+        )
     }
-
-
-def get_usd_thb():
-
-    try:
-
-        data = fetch_yahoo_data(
-            USDTHB_SYMBOL,
-            "5m",
-            "5d"
-        )
-
-        return data[-1]["close"]
-
-    except Exception as e:
-
-        print(
-            "USDTHB ERROR:",
-            e
-        )
-
-        return None
-
-
-# =========================================================
-# FORMAT
-# =========================================================
-
-def format_gold_price(value):
-
-    if value is None:
-        return "ไม่พบข้อมูล"
-
-    return f"${value:,.2f} / oz"
-
-
-def format_usd_thb(value):
-
-    if value is None:
-        return "ไม่พบข้อมูล"
-
-    return f"฿{value:,.2f}"
 
 
 # =========================================================
@@ -359,9 +295,7 @@ def format_usd_thb(value):
 
 def load_history():
 
-    if not os.path.exists(
-        HISTORY_FILE
-    ):
+    if not os.path.exists(HISTORY_FILE):
         return []
 
     try:
@@ -377,8 +311,9 @@ def load_history():
     except Exception as e:
 
         print(
-            "LOAD HISTORY ERROR:",
-            e
+            "❌ อ่าน history ไม่สำเร็จ:",
+            e,
+            flush=True
         )
 
         return []
@@ -397,149 +332,172 @@ def save_history(history):
             json.dump(
                 history,
                 f,
-                ensure_ascii=False
+                ensure_ascii=False,
+                indent=2
             )
 
     except Exception as e:
 
         print(
-            "SAVE HISTORY ERROR:",
-            e
+            "❌ บันทึก history ไม่สำเร็จ:",
+            e,
+            flush=True
         )
 
 
-def append_history(
-    market_data,
-    usd_thb
-):
+def append_price_history():
 
-    history = load_history()
+    try:
 
-    now = datetime.now(TZ)
+        current = get_current_price()
 
-    history.append({
+        history = load_history()
 
-        "ts": now.isoformat(),
+        now = datetime.now(TZ)
 
-        "gold_spot":
-            market_data["price"],
+        history.append({
+            "ts": now.isoformat(),
+            "price": current["price"]
+        })
 
-        "open":
-            market_data["open"],
+        cutoff = now - timedelta(days=30)
 
-        "high":
-            market_data["high"],
+        new_history = []
 
-        "low":
-            market_data["low"],
+        for item in history:
 
-        "usd_thb":
-            usd_thb
-    })
+            try:
 
-    cutoff = (
-        now -
-        timedelta(
-            days=HISTORY_KEEP_DAYS
+                dt = datetime.fromisoformat(
+                    item["ts"]
+                )
+
+                if dt >= cutoff:
+                    new_history.append(item)
+
+            except Exception:
+                pass
+
+        save_history(new_history)
+
+        return current["price"]
+
+    except Exception as e:
+
+        print(
+            "❌ HISTORY ERROR:",
+            e,
+            flush=True
         )
-    )
 
-    cleaned = []
-
-    for h in history:
-
-        try:
-
-            dt = datetime.fromisoformat(
-                h["ts"]
-            )
-
-            if dt >= cutoff:
-                cleaned.append(h)
-
-        except Exception:
-            pass
-
-    save_history(cleaned)
-
-    return cleaned
-
-
-# =========================================================
-# MATH
-# =========================================================
-
-def sma(values, period):
-
-    if len(values) < period:
         return None
 
-    return sum(
-        values[-period:]
-    ) / period
+
+# =========================================================
+# MATH HELPERS
+# =========================================================
+
+def clean(values):
+
+    return [
+        float(x)
+        for x in values
+        if x is not None
+        and not math.isnan(float(x))
+    ]
 
 
 def ema(values, period):
 
+    values = clean(values)
+
     if len(values) < period:
         return None
 
-    multiplier = 2 / (
-        period + 1
-    )
+    multiplier = 2 / (period + 1)
 
-    result = sum(
-        values[:period]
-    ) / period
+    result = (
+        sum(values[:period])
+        / period
+    )
 
     for price in values[period:]:
 
         result = (
             (price - result)
             * multiplier
-        ) + result
+            + result
+        )
 
     return result
 
 
-def calculate_rsi(
-    closes,
-    period=14
-):
+def ema_series(values, period):
 
-    if len(closes) <= period:
+    values = clean(values)
+
+    if len(values) < period:
+        return []
+
+    multiplier = 2 / (period + 1)
+
+    current = (
+        sum(values[:period])
+        / period
+    )
+
+    result = [current]
+
+    for price in values[period:]:
+
+        current = (
+            (price - current)
+            * multiplier
+            + current
+        )
+
+        result.append(current)
+
+    return result
+
+
+# =========================================================
+# RSI
+# =========================================================
+
+def rsi(values, period=14):
+
+    values = clean(values)
+
+    if len(values) < period + 1:
         return None
 
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(closes)
-    ):
+    for i in range(1, len(values)):
 
         change = (
-            closes[i] -
-            closes[i - 1]
+            values[i]
+            - values[i - 1]
         )
 
-        if change > 0:
-
+        if change >= 0:
             gains.append(change)
             losses.append(0)
-
         else:
-
             gains.append(0)
             losses.append(abs(change))
 
-    avg_gain = sum(
-        gains[:period]
-    ) / period
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    avg_loss = sum(
-        losses[:period]
-    ) / period
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
 
     for i in range(
         period,
@@ -547,12 +505,18 @@ def calculate_rsi(
     ):
 
         avg_gain = (
-            (avg_gain * (period - 1))
+            (
+                avg_gain
+                * (period - 1)
+            )
             + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
+            (
+                avg_loss
+                * (period - 1)
+            )
             + losses[i]
         ) / period
 
@@ -566,247 +530,252 @@ def calculate_rsi(
     )
 
 
-def calculate_atr(
-    rows,
-    period=14
-):
+# =========================================================
+# MACD
+# =========================================================
 
-    if len(rows) <= period:
+def macd(values):
+
+    values = clean(values)
+
+    if len(values) < 35:
         return None
 
-    true_ranges = []
-
-    for i in range(
-        1,
-        len(rows)
-    ):
-
-        high = rows[i]["high"]
-        low = rows[i]["low"]
-        prev_close = rows[i - 1]["close"]
-
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close)
-        )
-
-        true_ranges.append(tr)
-
-    return sma(
-        true_ranges,
-        period
+    ema12 = ema_series(
+        values,
+        12
     )
 
+    ema26 = ema_series(
+        values,
+        26
+    )
 
-def calculate_macd(
-    closes
-):
-
-    if len(closes) < 35:
+    if not ema12 or not ema26:
         return None
 
-    ema12_values = []
-
-    ema26_values = []
-
-    for i in range(
-        len(closes)
-    ):
-
-        subset = closes[:i + 1]
-
-        e12 = ema(
-            subset,
-            12
-        )
-
-        e26 = ema(
-            subset,
-            26
-        )
-
-        if e12 is not None:
-            ema12_values.append(e12)
-
-        if e26 is not None:
-            ema26_values.append(e26)
-
+    # ทำให้ series อยู่ตำแหน่งเดียวกัน
     macd_values = []
 
+    offset = len(ema12) - len(ema26)
+
     for i in range(
-        len(closes)
+        len(ema26)
     ):
 
-        e12 = ema(
-            closes[:i + 1],
-            12
+        macd_values.append(
+            ema12[i + offset]
+            - ema26[i]
         )
 
-        e26 = ema(
-            closes[:i + 1],
-            26
-        )
-
-        if e12 is not None and e26 is not None:
-
-            macd_values.append(
-                e12 - e26
-            )
-
-    if len(macd_values) < 9:
-        return None
-
-    signal = ema(
+    signal_series = ema_series(
         macd_values,
         9
     )
 
-    if signal is None:
+    if not signal_series:
         return None
 
-    macd = macd_values[-1]
+    macd_current = (
+        macd_values[-1]
+    )
+
+    signal_current = (
+        signal_series[-1]
+    )
 
     histogram = (
-        macd - signal
+        macd_current
+        - signal_current
     )
 
     return {
-        "macd": macd,
-        "signal": signal,
+        "macd": macd_current,
+        "signal": signal_current,
         "histogram": histogram
     }
+
+
+# =========================================================
+# ATR
+# =========================================================
+
+def atr(candles, period=14):
+
+    if len(candles) < period + 1:
+        return None
+
+    trs = []
+
+    for i in range(
+        1,
+        len(candles)
+    ):
+
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current["high"]
+            - current["low"],
+
+            abs(
+                current["high"]
+                - previous["close"]
+            ),
+
+            abs(
+                current["low"]
+                - previous["close"]
+            )
+        )
+
+        trs.append(tr)
+
+    if len(trs) < period:
+        return None
+
+    return (
+        sum(trs[-period:])
+        / period
+    )
 
 
 # =========================================================
 # SUPPORT / RESISTANCE
 # =========================================================
 
-def support_resistance(
-    rows,
-    lookback=50
-):
+def support_resistance(candles):
 
-    rows = rows[-lookback:]
-
-    if len(rows) < 10:
+    if len(candles) < 20:
         return None, None
 
-    resistance = max(
-        r["high"]
-        for r in rows
-    )
+    recent = candles[-50:]
 
-    support = min(
-        r["low"]
-        for r in rows
-    )
+    highs = [
+        c["high"]
+        for c in recent
+    ]
+
+    lows = [
+        c["low"]
+        for c in recent
+    ]
+
+    resistance = max(highs)
+
+    support = min(lows)
 
     return support, resistance
 
 
 # =========================================================
-# CANDLE PATTERNS
+# CANDLE PATTERN
 # =========================================================
 
-def detect_candle_pattern(
-    rows
-):
+def candle_pattern(candles):
 
-    if len(rows) < 3:
+    if len(candles) < 3:
         return "ไม่มีข้อมูล"
 
-    a = rows[-3]
-    b = rows[-2]
-    c = rows[-1]
+    a = candles[-2]
+    b = candles[-1]
 
-    body = abs(
-        c["close"] -
-        c["open"]
+    body_a = abs(
+        a["close"]
+        - a["open"]
     )
 
-    candle_range = (
-        c["high"] -
-        c["low"]
+    body_b = abs(
+        b["close"]
+        - b["open"]
     )
 
-    if candle_range <= 0:
-        return "ปกติ"
+    range_b = (
+        b["high"]
+        - b["low"]
+    )
 
-    upper_wick = (
-        c["high"] -
-        max(
-            c["open"],
-            c["close"]
+    if range_b <= 0:
+        return "ไม่มี Pattern ชัดเจน"
+
+    upper = (
+        b["high"]
+        - max(
+            b["open"],
+            b["close"]
         )
     )
 
-    lower_wick = (
+    lower = (
         min(
-            c["open"],
-            c["close"]
-        ) -
-        c["low"]
+            b["open"],
+            b["close"]
+        )
+        - b["low"]
     )
-
-    # Doji
-    if body <= candle_range * 0.1:
-
-        return "Doji — ตลาดลังเล"
-
-    # Hammer
-    if (
-        lower_wick >= body * 2
-        and upper_wick <= body
-    ):
-
-        return "Hammer — มีแรงซื้อกลับ"
-
-    # Shooting Star
-    if (
-        upper_wick >= body * 2
-        and lower_wick <= body
-    ):
-
-        return "Shooting Star — มีแรงขายกด"
 
     # Bullish engulfing
     if (
-        b["close"] < b["open"]
-        and c["close"] > c["open"]
-        and c["close"] >= b["open"]
-        and c["open"] <= b["close"]
+        a["close"] < a["open"]
+        and b["close"] > b["open"]
+        and b["open"] <= a["close"]
+        and b["close"] >= a["open"]
     ):
-
-        return "Bullish Engulfing — สัญญาณซื้อ"
+        return "Bullish Engulfing 🟢"
 
     # Bearish engulfing
     if (
-        b["close"] > b["open"]
-        and c["close"] < c["open"]
-        and c["open"] >= b["close"]
-        and c["close"] <= b["open"]
+        a["close"] > a["open"]
+        and b["close"] < b["open"]
+        and b["open"] >= a["close"]
+        and b["close"] <= a["open"]
     ):
+        return "Bearish Engulfing 🔴"
 
-        return "Bearish Engulfing — สัญญาณขาย"
+    # Hammer
+    if (
+        lower > body_b * 2
+        and upper < body_b
+    ):
+        return "Hammer 🟢"
 
-    return "ปกติ"
+    # Shooting star
+    if (
+        upper > body_b * 2
+        and lower < body_b
+    ):
+        return "Shooting Star 🔴"
+
+    # Doji
+    if (
+        body_b <= range_b * 0.1
+    ):
+        return "Doji ⚠️"
+
+    return "ไม่มี Pattern เด่น"
 
 
 # =========================================================
-# MARKET ANALYSIS
+# ANALYSIS
 # =========================================================
 
-def analyze_market(
-    rows
+def analyze_candles(
+    candles,
+    timeframe
 ):
 
-    if len(rows) < 50:
-        return None
+    if len(candles) < 50:
+
+        return {
+            "ok": False,
+            "message":
+                "ข้อมูลยังไม่พอสำหรับวิเคราะห์"
+        }
 
     closes = [
-        r["close"]
-        for r in rows
+        c["close"]
+        for c in candles
     ]
 
     current = closes[-1]
@@ -826,41 +795,42 @@ def analyze_market(
         200
     )
 
-    rsi = calculate_rsi(
+    rsi14 = rsi(
         closes,
         14
     )
 
-    macd = calculate_macd(
+    macd_data = macd(
         closes
     )
 
-    atr = calculate_atr(
-        rows,
+    atr14 = atr(
+        candles,
         14
     )
 
     support, resistance = (
         support_resistance(
-            rows,
-            50
+            candles
         )
     )
 
-    pattern = detect_candle_pattern(
-        rows
+    pattern = candle_pattern(
+        candles
     )
 
     score = 0
     reasons = []
 
-    # EMA20
-    if ema20:
+    # -----------------------------------------
+    # EMA
+    # -----------------------------------------
+
+    if ema20 is not None:
 
         if current > ema20:
 
             score += 1
-
             reasons.append(
                 "ราคาอยู่เหนือ EMA20"
             )
@@ -868,473 +838,834 @@ def analyze_market(
         else:
 
             score -= 1
-
             reasons.append(
                 "ราคาอยู่ต่ำกว่า EMA20"
             )
 
-    # EMA50
-    if ema50:
+    if (
+        ema20 is not None
+        and ema50 is not None
+    ):
 
-        if current > ema50:
+        if ema20 > ema50:
 
             score += 2
-
             reasons.append(
-                "ราคาอยู่เหนือ EMA50"
+                "EMA20 > EMA50"
             )
 
         else:
 
             score -= 2
-
             reasons.append(
-                "ราคาอยู่ต่ำกว่า EMA50"
+                "EMA20 < EMA50"
             )
 
-    # EMA200
-    if ema200:
+    if ema200 is not None:
 
         if current > ema200:
 
-            score += 3
-
-            reasons.append(
-                "ราคาอยู่เหนือ EMA200"
-            )
-
-        else:
-
-            score -= 3
-
-            reasons.append(
-                "ราคาอยู่ต่ำกว่า EMA200"
-            )
-
-    # RSI
-    if rsi is not None:
-
-        if rsi >= 70:
-
-            reasons.append(
-                "RSI สูง — ระวัง Overbought"
-            )
-
-        elif rsi <= 30:
-
-            reasons.append(
-                "RSI ต่ำ — ระวัง Oversold"
-            )
-
-        elif rsi > 50:
-
-            score += 1
-
-            reasons.append(
-                "RSI > 50"
-            )
-
-        else:
-
-            score -= 1
-
-            reasons.append(
-                "RSI < 50"
-            )
-
-    # MACD
-    if macd:
-
-        if macd["histogram"] > 0:
-
             score += 2
-
             reasons.append(
-                "MACD เป็นบวก"
+                "ราคาเหนือ EMA200"
             )
 
         else:
 
             score -= 2
-
             reasons.append(
-                "MACD เป็นลบ"
+                "ราคาต่ำกว่า EMA200"
             )
 
-    # Trend
-    if score >= 5:
+    # -----------------------------------------
+    # RSI
+    # -----------------------------------------
 
-        trend = "ขาขึ้นแรง"
+    if rsi14 is not None:
 
-    elif score >= 2:
+        if 50 <= rsi14 <= 70:
 
-        trend = "ขาขึ้น"
+            score += 1
+            reasons.append(
+                "RSI สนับสนุนโมเมนตัมขาขึ้น"
+            )
 
-    elif score <= -5:
+        elif 30 <= rsi14 < 50:
 
-        trend = "ขาลงแรง"
+            score -= 1
+            reasons.append(
+                "RSI ยังไม่แข็งแรงฝั่งขึ้น"
+            )
 
-    elif score <= -2:
+        elif rsi14 > 70:
 
-        trend = "ขาลง"
+            reasons.append(
+                "RSI อยู่เขต Overbought"
+            )
 
-    else:
+        elif rsi14 < 30:
 
-        trend = "Sideway / รอความชัดเจน"
+            reasons.append(
+                "RSI อยู่เขต Oversold"
+            )
 
-    # Signal
-    if (
-        score >= 6
-        and rsi is not None
-        and rsi < 70
-    ):
+    # -----------------------------------------
+    # MACD
+    # -----------------------------------------
 
-        signal = "🟢 BUY BIAS"
+    if macd_data:
+
+        if (
+            macd_data["macd"]
+            > macd_data["signal"]
+        ):
+
+            score += 2
+            reasons.append(
+                "MACD อยู่เหนือ Signal"
+            )
+
+        else:
+
+            score -= 2
+            reasons.append(
+                "MACD อยู่ต่ำกว่า Signal"
+            )
+
+    # -----------------------------------------
+    # Candle
+    # -----------------------------------------
+
+    if "Bullish" in pattern:
+
+        score += 1
 
     elif (
-        score <= -6
-        and rsi is not None
-        and rsi > 30
+        "Bearish" in pattern
+        or "Shooting" in pattern
     ):
 
+        score -= 1
+
+    # -----------------------------------------
+    # SIGNAL
+    # -----------------------------------------
+
+    if score >= 6:
+
+        signal = "🟢 BUY BIAS"
+        trend = "ขาขึ้น"
+
+    elif score >= 3:
+
+        signal = "🟢 Bullish"
+        trend = "เอนเอียงขาขึ้น"
+
+    elif score <= -6:
+
         signal = "🔴 SELL BIAS"
+        trend = "ขาลง"
+
+    elif score <= -3:
+
+        signal = "🔴 Bearish"
+        trend = "เอนเอียงขาลง"
 
     else:
 
         signal = "🟡 WAIT"
+        trend = "Sideway / ไม่ชัดเจน"
 
     return {
+        "ok": True,
 
-        "price":
-            current,
+        "timeframe": timeframe,
 
-        "ema20":
-            ema20,
+        "current": current,
 
-        "ema50":
-            ema50,
+        "ema20": ema20,
+        "ema50": ema50,
+        "ema200": ema200,
 
-        "ema200":
-            ema200,
+        "rsi": rsi14,
 
-        "rsi":
-            rsi,
+        "macd": macd_data,
 
-        "macd":
-            macd,
+        "atr": atr14,
 
-        "atr":
-            atr,
+        "support": support,
+        "resistance": resistance,
 
-        "support":
-            support,
+        "pattern": pattern,
 
-        "resistance":
-            resistance,
+        "score": score,
 
-        "pattern":
-            pattern,
+        "signal": signal,
 
-        "score":
-            score,
+        "trend": trend,
 
-        "trend":
-            trend,
-
-        "signal":
-            signal,
-
-        "reasons":
-            reasons
+        "reasons": reasons
     }
 
 
 # =========================================================
-# MULTI TIMEFRAME
+# TIMEFRAME DATA
 # =========================================================
 
-def get_multi_timeframe():
+def get_timeframe_candles(
+    timeframe
+):
 
-    result = {}
+    if timeframe == "5m":
 
-    for tf, config in TIMEFRAMES.items():
+        return get_candles(
+            "5m",
+            "5d"
+        )
 
-        try:
+    if timeframe == "15m":
 
-            rows = fetch_yahoo_data(
-                XAU_SYMBOL,
-                config["interval"],
-                config["range"]
-            )
+        return get_candles(
+            "15m",
+            "60d"
+        )
 
-            analysis = analyze_market(
-                rows
-            )
+    if timeframe == "1h":
 
-            if analysis:
+        return get_candles(
+            "1h",
+            "730d"
+        )
 
-                result[tf] = analysis
+    if timeframe == "4h":
 
-        except Exception as e:
+        # Yahoo มี 1h จึงนำมารวมเป็น 4h
+        candles = get_candles(
+            "1h",
+            "730d"
+        )
 
-            print(
-                f"{tf} ERROR:",
-                e
-            )
+        return resample_4h(
+            candles
+        )
+
+    if timeframe == "1d":
+
+        return get_candles(
+            "1d",
+            "5y"
+        )
+
+    raise ValueError(
+        "Timeframe ไม่ถูกต้อง"
+    )
+
+
+# =========================================================
+# 4H RESAMPLE
+# =========================================================
+
+def resample_4h(candles):
+
+    if not candles:
+        return []
+
+    result = []
+
+    bucket = []
+
+    current_bucket = None
+
+    for candle in candles:
+
+        dt = candle["datetime"]
+
+        # แบ่งตามทุก 4 ชั่วโมง
+        hour = (
+            dt.hour // 4
+        ) * 4
+
+        bucket_key = (
+            dt.date(),
+            hour
+        )
+
+        if (
+            current_bucket is not None
+            and bucket_key
+            != current_bucket
+        ):
+
+            if bucket:
+
+                result.append({
+                    "timestamp":
+                        bucket[0]["timestamp"],
+
+                    "datetime":
+                        bucket[0]["datetime"],
+
+                    "open":
+                        bucket[0]["open"],
+
+                    "high":
+                        max(
+                            x["high"]
+                            for x in bucket
+                        ),
+
+                    "low":
+                        min(
+                            x["low"]
+                            for x in bucket
+                        ),
+
+                    "close":
+                        bucket[-1]["close"],
+
+                    "volume":
+                        sum(
+                            x["volume"]
+                            for x in bucket
+                        )
+                })
+
+            bucket = []
+
+        current_bucket = bucket_key
+
+        bucket.append(candle)
+
+    if bucket:
+
+        result.append({
+            "timestamp":
+                bucket[0]["timestamp"],
+
+            "datetime":
+                bucket[0]["datetime"],
+
+            "open":
+                bucket[0]["open"],
+
+            "high":
+                max(
+                    x["high"]
+                    for x in bucket
+                ),
+
+            "low":
+                min(
+                    x["low"]
+                    for x in bucket
+                ),
+
+            "close":
+                bucket[-1]["close"],
+
+            "volume":
+                sum(
+                    x["volume"]
+                    for x in bucket
+                )
+        })
 
     return result
 
 
 # =========================================================
-# TREND MESSAGE
+# FORMAT ANALYSIS
 # =========================================================
 
-def trend_emoji(trend):
+def fmt(value, digits=2):
 
-    if "ขาขึ้นแรง" in trend:
-        return "🚀"
+    if value is None:
+        return "N/A"
 
-    if "ขาขึ้น" in trend:
-        return "📈"
-
-    if "ขาลงแรง" in trend:
-        return "🔻"
-
-    if "ขาลง" in trend:
-        return "📉"
-
-    return "⏸️"
+    return f"{value:,.{digits}f}"
 
 
-def format_analysis(
-    analysis,
-    timeframe="5m"
-):
+def format_analysis(data):
 
-    if not analysis:
-
-        return "⚠️ ข้อมูลไม่เพียงพอ"
-
-    rsi_text = (
-        f"{analysis['rsi']:.2f}"
-        if analysis["rsi"] is not None
-        else "-"
-    )
-
-    macd_text = "-"
-
-    if analysis["macd"]:
-
-        macd_text = (
-            f"{analysis['macd']['macd']:.3f}"
+    if not data["ok"]:
+        return (
+            "⚠️ "
+            + data["message"]
         )
 
-    ema20_text = (
-        f"${analysis['ema20']:,.2f}"
-        if analysis["ema20"]
-        else "-"
-    )
+    macd_data = data["macd"]
 
-    ema50_text = (
-        f"${analysis['ema50']:,.2f}"
-        if analysis["ema50"]
-        else "-"
-    )
+    lines = [
 
-    ema200_text = (
-        f"${analysis['ema200']:,.2f}"
-        if analysis["ema200"]
-        else "-"
-    )
+        "🧠 **XAU/USD TECHNICAL ANALYSIS**",
 
-    support_text = (
-        f"${analysis['support']:,.2f}"
-        if analysis["support"]
-        else "-"
-    )
+        "━━━━━━━━━━━━━━━━━━━━",
 
-    resistance_text = (
-        f"${analysis['resistance']:,.2f}"
-        if analysis["resistance"]
-        else "-"
-    )
+        f"⏱️ Timeframe: **{data['timeframe']}**",
 
-    return (
-        f"{trend_emoji(analysis['trend'])} "
-        f"**GOLD ANALYSIS — {timeframe}**\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 ราคา: **${fmt(data['current'])}**",
 
-        f"💰 XAU/USD: "
-        f"**${analysis['price']:,.2f}**\n\n"
+        "",
 
-        f"📊 Trend: "
-        f"**{analysis['trend']}**\n"
+        f"🎯 Signal: **{data['signal']}**",
 
-        f"🎯 Score: "
-        f"**{analysis['score']}**\n"
+        f"📈 Trend: **{data['trend']}**",
 
-        f"🧭 Signal: "
-        f"**{analysis['signal']}**\n\n"
+        f"⭐ Score: **{data['score']:+d} / 10**",
 
-        f"📐 EMA20: **{ema20_text}**\n"
-        f"📐 EMA50: **{ema50_text}**\n"
-        f"📐 EMA200: **{ema200_text}**\n\n"
+        "",
 
-        f"📊 RSI14: **{rsi_text}**\n"
-        f"📉 MACD: **{macd_text}**\n"
-        f"🌊 ATR14: "
-        f"**{analysis['atr']:.2f}**\n"
-        if analysis["atr"] is not None
-        else
-        f"📊 RSI14: **{rsi_text}**\n"
-        f"📉 MACD: **{macd_text}**\n"
-        f"🌊 ATR14: **-**\n"
-    ) + (
+        "📐 **EMA**",
 
-        f"\n🟢 Support: "
-        f"**{support_text}**\n"
+        f"EMA20: **{fmt(data['ema20'])}**",
 
-        f"🔴 Resistance: "
-        f"**{resistance_text}**\n\n"
+        f"EMA50: **{fmt(data['ema50'])}**",
 
-        f"🕯️ Pattern: "
-        f"**{analysis['pattern']}**\n\n"
+        f"EMA200: **{fmt(data['ema200'])}**",
 
-        "🔎 **เหตุผลหลัก**\n"
-        +
-        "\n".join(
-            f"• {r}"
-            for r in analysis["reasons"][:6]
+        "",
+
+        "📊 **RSI**",
+
+        f"RSI14: **{fmt(data['rsi'])}**",
+
+        "",
+
+        "📉 **MACD**",
+
+        (
+            f"MACD: **{fmt(macd_data['macd'])}**\n"
+            f"Signal: **{fmt(macd_data['signal'])}**\n"
+            f"Histogram: **{fmt(macd_data['histogram'])}**"
+            if macd_data
+            else "N/A"
+        ),
+
+        "",
+
+        "🌊 **ATR**",
+
+        f"ATR14: **{fmt(data['atr'])}**",
+
+        "",
+
+        "🎯 **Support / Resistance**",
+
+        f"Support: **${fmt(data['support'])}**",
+
+        f"Resistance: **${fmt(data['resistance'])}**",
+
+        "",
+
+        f"🕯️ Pattern: **{data['pattern']}**",
+
+        "",
+
+        "🔎 **เหตุผล**"
+    ]
+
+    for reason in data["reasons"]:
+
+        lines.append(
+            f"• {reason}"
         )
+
+    lines.extend([
+
+        "",
+
+        "⚠️ **หมายเหตุ**",
+
+        "Signal เป็นการประเมินทางเทคนิค "
+        "ไม่ใช่คำสั่งซื้อขายอัตโนมัติ",
+
+    ])
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# MTF ANALYSIS
+# =========================================================
+
+def get_mtf():
+
+    timeframes = [
+        "5m",
+        "15m",
+        "1h",
+        "4h",
+        "1d"
+    ]
+
+    results = []
+
+    for tf in timeframes:
+
+        try:
+
+            candles = (
+                get_timeframe_candles(
+                    tf
+                )
+            )
+
+            analysis = (
+                analyze_candles(
+                    candles,
+                    tf
+                )
+            )
+
+            results.append(
+                analysis
+            )
+
+        except Exception as e:
+
+            results.append({
+                "ok": False,
+                "timeframe": tf,
+                "message": str(e)
+            })
+
+    return results
+
+
+def format_mtf(results):
+
+    lines = [
+
+        "🧠 **XAU/USD MULTI-TIMEFRAME**",
+
+        "━━━━━━━━━━━━━━━━━━━━",
+
+        "ดูภาพใหญ่ก่อนใช้ Timeframe เล็ก",
+
+        ""
+    ]
+
+    total = 0
+
+    valid = 0
+
+    for data in results:
+
+        tf = data["timeframe"]
+
+        if not data["ok"]:
+
+            lines.append(
+                f"⏱️ **{tf}** → ⚠️ ไม่มีข้อมูล"
+            )
+
+            continue
+
+        valid += 1
+
+        score = data["score"]
+
+        total += score
+
+        lines.append(
+            f"⏱️ **{tf}** → "
+            f"{data['signal']} "
+            f"({score:+d})"
+        )
+
+    lines.append("")
+
+    if valid:
+
+        average = total / valid
+
+        if average >= 3:
+
+            overall = (
+                "🟢 **ภาพรวมเอนเอียงขาขึ้น**"
+            )
+
+        elif average <= -3:
+
+            overall = (
+                "🔴 **ภาพรวมเอนเอียงขาลง**"
+            )
+
+        else:
+
+            overall = (
+                "🟡 **ภาพรวมยังไม่ชัดเจน**"
+            )
+
+        lines.extend([
+
+            f"📊 Average Score: "
+            f"**{average:+.2f}**",
+
+            "",
+
+            overall,
+
+            "",
+
+            "💡 แนวคิด:",
+
+            "• 1D / 4H = ดูทิศทางใหญ่",
+
+            "• 1H = ดูโครงสร้างกลาง",
+
+            "• 15M / 5M = ใช้หาจังหวะ",
+
+            "",
+
+            "⚠️ อย่าใช้ Timeframe เดียว "
+            "ตัดสินใจซื้อขาย"
+        ])
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# ALERT
+# =========================================================
+
+last_alert_time = None
+last_alert_signal = None
+
+
+async def send_alert(message):
+
+    if ALERT_CHANNEL_ID == 0:
+
+        print(
+            "⚠️ ALERT_CHANNEL_ID = 0",
+            flush=True
+        )
+
+        return
+
+    channel = bot.get_channel(
+        ALERT_CHANNEL_ID
+    )
+
+    if channel is None:
+
+        try:
+
+            channel = await bot.fetch_channel(
+                ALERT_CHANNEL_ID
+            )
+
+        except Exception as e:
+
+            print(
+                "❌ ไม่พบ Alert Channel:",
+                e,
+                flush=True
+            )
+
+            return
+
+    await channel.send(
+        message
     )
 
 
-# =========================================================
-# MARKET STATUS
-# =========================================================
+def should_alert(analysis):
 
-def market_status():
+    global last_alert_time
+    global last_alert_signal
+
+    if not analysis["ok"]:
+        return False
+
+    score = analysis["score"]
+
+    if abs(score) < ALERT_SCORE:
+        return False
+
+    if score >= ALERT_SCORE:
+
+        signal = "BUY"
+
+    else:
+
+        signal = "SELL"
+
+    now = datetime.now(TZ)
+
+    if last_alert_time is not None:
+
+        elapsed = (
+            now - last_alert_time
+        ).total_seconds() / 60
+
+        if (
+            elapsed
+            < ALERT_COOLDOWN_MINUTES
+            and signal
+            == last_alert_signal
+        ):
+
+            return False
+
+    last_alert_time = now
+    last_alert_signal = signal
+
+    return True
+
+
+async def check_market():
 
     try:
 
-        data = get_gold_market()
+        current = get_current_price()
 
-        usd_thb = get_usd_thb()
+        price = current["price"]
 
-        return data, usd_thb
+        print(
+            f"💰 XAU/USD: ${price:,.2f}",
+            flush=True
+        )
+
+        append_price_history()
+
+        # วิเคราะห์ 15m สำหรับ Alert
+        candles = get_timeframe_candles(
+            "15m"
+        )
+
+        analysis = analyze_candles(
+            candles,
+            "15m"
+        )
+
+        if should_alert(analysis):
+
+            direction = (
+                "📈 BUY BIAS"
+                if analysis["score"] > 0
+                else "📉 SELL BIAS"
+            )
+
+            message = (
+
+                "🚨 **XAU/USD TRADING ALERT**\n"
+
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+                f"💰 ราคา: "
+                f"**${price:,.2f}**\n\n"
+
+                f"{direction}\n"
+
+                f"⭐ Score: "
+                f"**{analysis['score']:+d}**\n"
+
+                f"📊 Trend: "
+                f"**{analysis['trend']}**\n\n"
+
+                f"📐 EMA20: "
+                f"**{fmt(analysis['ema20'])}**\n"
+
+                f"📐 EMA50: "
+                f"**{fmt(analysis['ema50'])}**\n"
+
+                f"📐 EMA200: "
+                f"**{fmt(analysis['ema200'])}**\n\n"
+
+                f"RSI14: "
+                f"**{fmt(analysis['rsi'])}**\n"
+
+                f"ATR14: "
+                f"**{fmt(analysis['atr'])}**\n\n"
+
+                f"🕯️ Pattern: "
+                f"**{analysis['pattern']}**\n\n"
+
+                "⚠️ เป็น Alert เชิงเทคนิค "
+                "ไม่ใช่คำสั่งซื้อขาย"
+            )
+
+            await send_alert(
+                message
+            )
 
     except Exception as e:
 
         print(
-            "MARKET STATUS ERROR:",
-            e
+            "❌ MARKET CHECK ERROR:",
+            repr(e),
+            flush=True
         )
 
-        return None, None
+
+@tasks.loop(
+    minutes=CHECK_INTERVAL_MINUTES
+)
+async def market_loop():
+
+    await check_market()
 
 
 # =========================================================
-# PRICE CHART
+# DISCORD READY
 # =========================================================
 
-def make_price_chart(
-    rows,
-    title
-):
+@bot.event
+async def on_ready():
 
-    if len(rows) < 2:
-        return None
-
-    rows = rows[-500:]
-
-    times = []
-
-    prices = []
-
-    for r in rows:
-
-        try:
-
-            times.append(
-                datetime.fromisoformat(
-                    r["timestamp"]
-                )
-            )
-
-            prices.append(
-                r["close"]
-            )
-
-        except Exception:
-            pass
-
-    if len(prices) < 2:
-        return None
-
-    fig, ax = plt.subplots(
-        figsize=(10, 5),
-        dpi=140
+    print(
+        "==============================",
+        flush=True
     )
 
-    ax.plot(
-        times,
-        prices,
-        linewidth=2
+    print(
+        f"🤖 Discord Bot ONLINE: "
+        f"{bot.user}",
+        flush=True
     )
 
-    ax.axhline(
-        max(prices),
-        linestyle="--",
-        alpha=0.4
+    print(
+        "==============================",
+        flush=True
     )
 
-    ax.axhline(
-        min(prices),
-        linestyle="--",
-        alpha=0.4
-    )
+    try:
 
-    ax.set_title(
-        title,
-        fontsize=14,
-        fontweight="bold"
-    )
+        synced = await bot.tree.sync()
 
-    ax.set_ylabel(
-        "XAU/USD"
-    )
-
-    ax.grid(
-        True,
-        alpha=0.25
-    )
-
-    ax.xaxis.set_major_formatter(
-        mdates.DateFormatter(
-            "%d/%m %H:%M"
+        print(
+            f"🔧 Slash Commands synced: "
+            f"{len(synced)}",
+            flush=True
         )
-    )
 
-    fig.autofmt_xdate()
+    except Exception as e:
 
-    fig.tight_layout()
+        print(
+            "❌ Slash Sync Error:",
+            repr(e),
+            flush=True
+        )
 
-    path = "gold_chart.png"
+    if not market_loop.is_running():
 
-    fig.savefig(path)
+        market_loop.start()
 
-    plt.close(fig)
-
-    return path
+        print(
+            "🚀 Market monitoring STARTED",
+            flush=True
+        )
 
 
 # =========================================================
-# GOLD COMMAND
+# /gold
 # =========================================================
 
 @bot.tree.command(
     name="gold",
-    description="ดูราคาทอง Spot และตลาดทอง"
+    description="ดูราคาทอง XAU/USD ปัจจุบัน"
 )
 async def gold(
     interaction: discord.Interaction
@@ -1344,43 +1675,62 @@ async def gold(
 
     try:
 
-        market, usd_thb = (
-            market_status()
-        )
+        current = get_current_price()
 
-        if market is None:
+        price = current["price"]
 
-            await interaction.followup.send(
-                "❌ ไม่สามารถดึงราคาทองได้"
+        previous = current["previous"]
+
+        if previous:
+
+            change = (
+                price - previous
             )
 
-            return
+            pct = (
+                change
+                / previous
+                * 100
+            )
+
+        else:
+
+            change = None
+            pct = None
+
+        direction = (
+            "📈"
+            if change is not None
+            and change > 0
+            else
+            "📉"
+            if change is not None
+            and change < 0
+            else
+            "➖"
+        )
 
         message = (
 
-            "🪙 **GOLD MARKET**\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🥇 **XAU/USD GOLD**\n"
 
-            f"🌎 XAU/USD\n"
-            f"💰 **${market['price']:,.2f} / oz**\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-            f"📌 Open: "
-            f"**${market['open']:,.2f}**\n"
+            f"💰 ราคา: "
+            f"**${price:,.2f} / oz**\n\n"
 
-            f"🔺 High: "
-            f"**${market['high']:,.2f}**\n"
+            f"{direction} Daily Change: "
+            f"**{fmt(change)}**\n"
 
-            f"🔻 Low: "
-            f"**${market['low']:,.2f}**\n\n"
+            f"📊 Change %: "
+            f"**{fmt(pct)}%**\n\n"
 
-            f"💵 USD/THB: "
-            f"**{format_usd_thb(usd_thb)}**\n\n"
+            "🌎 ตลาด: **XAU/USD**\n"
 
-            f"🕒 Update: "
-            f"{market['timestamp']}\n\n"
+            "📡 Source: Yahoo Finance\n\n"
 
-            "📡 Data: Yahoo Finance\n"
-            "🆓 ระบบใช้แหล่งข้อมูลฟรี"
+            "⚠️ ราคาตลาดโลกมีช่วงเปิด/ปิด "
+            "จึงไม่ใช่ข้อมูล 24/7 ทุกนาที"
         )
 
         await interaction.followup.send(
@@ -1390,22 +1740,24 @@ async def gold(
     except Exception as e:
 
         print(
-            "GOLD COMMAND ERROR:",
-            e
+            "❌ GOLD COMMAND ERROR:",
+            repr(e),
+            flush=True
         )
 
         await interaction.followup.send(
-            "❌ เกิดข้อผิดพลาดในการดึงข้อมูล"
+            "❌ ไม่สามารถดึงราคา XAU/USD ได้\n"
+            f"Error: `{str(e)[:500]}`"
         )
 
 
 # =========================================================
-# ANALYZE COMMAND
+# /analyze
 # =========================================================
 
 @bot.tree.command(
     name="analyze",
-    description="วิเคราะห์ทองด้วย Technical Analysis"
+    description="วิเคราะห์ XAU/USD ด้วย Technical Analysis"
 )
 @app_commands.describe(
     timeframe="เลือก Timeframe"
@@ -1448,48 +1800,44 @@ async def analyze(
 
     try:
 
-        config = TIMEFRAMES[
-            timeframe.value
-        ]
-
-        rows = fetch_yahoo_data(
-            XAU_SYMBOL,
-            config["interval"],
-            config["range"]
+        candles = (
+            get_timeframe_candles(
+                timeframe.value
+            )
         )
 
-        result = analyze_market(
-            rows
-        )
-
-        message = format_analysis(
-            result,
+        result = analyze_candles(
+            candles,
             timeframe.value
         )
 
         await interaction.followup.send(
-            message
+            format_analysis(
+                result
+            )
         )
 
     except Exception as e:
 
         print(
-            "ANALYZE ERROR:",
-            e
+            "❌ ANALYZE ERROR:",
+            repr(e),
+            flush=True
         )
 
         await interaction.followup.send(
-            "❌ วิเคราะห์ราคาไม่สำเร็จ"
+            "❌ วิเคราะห์ไม่ได้\n"
+            f"Error: `{str(e)[:500]}`"
         )
 
 
 # =========================================================
-# MULTI TIMEFRAME COMMAND
+# /mtf
 # =========================================================
 
 @bot.tree.command(
     name="mtf",
-    description="วิเคราะห์ทองหลาย Timeframe"
+    description="วิเคราะห์ XAU/USD หลาย Timeframe"
 )
 async def mtf(
     interaction: discord.Interaction
@@ -1499,71 +1847,35 @@ async def mtf(
 
     try:
 
-        results = get_multi_timeframe()
-
-        if not results:
-
-            await interaction.followup.send(
-                "⚠️ ไม่มีข้อมูลสำหรับวิเคราะห์"
-            )
-
-            return
-
-        lines = [
-            "🧠 **GOLD MULTI-TIMEFRAME ANALYSIS**",
-            "━━━━━━━━━━━━━━━━━━",
-            ""
-        ]
-
-        for tf in [
-            "5m",
-            "15m",
-            "1h",
-            "4h",
-            "1d"
-        ]:
-
-            if tf not in results:
-                continue
-
-            a = results[tf]
-
-            lines.append(
-                f"{trend_emoji(a['trend'])} "
-                f"**{tf}** — "
-                f"{a['trend']} | "
-                f"Score **{a['score']}** | "
-                f"{a['signal']}"
-            )
-
-        lines.append("")
-        lines.append(
-            "📌 ใช้หลาย Timeframe เพื่อลดการตัดสินใจจากกราฟเดียว"
-        )
+        results = get_mtf()
 
         await interaction.followup.send(
-            "\n".join(lines)
+            format_mtf(
+                results
+            )
         )
 
     except Exception as e:
 
         print(
-            "MTF ERROR:",
-            e
+            "❌ MTF ERROR:",
+            repr(e),
+            flush=True
         )
 
         await interaction.followup.send(
-            "❌ วิเคราะห์ MTF ไม่สำเร็จ"
+            "❌ MTF วิเคราะห์ไม่ได้\n"
+            f"Error: `{str(e)[:500]}`"
         )
 
 
 # =========================================================
-# TREND COMMAND
+# /ema
 # =========================================================
 
 @bot.tree.command(
-    name="trend",
-    description="ดูแนวโน้มทอง"
+    name="ema",
+    description="ดู EMA20 EMA50 EMA200"
 )
 @app_commands.describe(
     timeframe="เลือก Timeframe"
@@ -1572,32 +1884,32 @@ async def mtf(
     timeframe=[
 
         app_commands.Choice(
-            name="5 นาที",
+            name="5m",
             value="5m"
         ),
 
         app_commands.Choice(
-            name="15 นาที",
+            name="15m",
             value="15m"
         ),
 
         app_commands.Choice(
-            name="1 ชั่วโมง",
+            name="1h",
             value="1h"
         ),
 
         app_commands.Choice(
-            name="4 ชั่วโมง",
+            name="4h",
             value="4h"
         ),
 
         app_commands.Choice(
-            name="1 วัน",
+            name="1d",
             value="1d"
         )
     ]
 )
-async def trend(
+async def ema_command(
     interaction: discord.Interaction,
     timeframe: app_commands.Choice[str]
 ):
@@ -1606,178 +1918,52 @@ async def trend(
 
     try:
 
-        config = TIMEFRAMES[
-            timeframe.value
-        ]
-
-        rows = fetch_yahoo_data(
-            XAU_SYMBOL,
-            config["interval"],
-            config["range"]
-        )
-
-        analysis = analyze_market(
-            rows
-        )
-
-        if not analysis:
-
-            await interaction.followup.send(
-                "⚠️ ข้อมูลไม่เพียงพอ"
+        candles = (
+            get_timeframe_candles(
+                timeframe.value
             )
-
-            return
-
-        message = (
-
-            f"{trend_emoji(analysis['trend'])} "
-            f"**GOLD TREND — {timeframe.value}**\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-
-            f"💰 ราคา: "
-            f"**${analysis['price']:,.2f}**\n\n"
-
-            f"📈 แนวโน้ม: "
-            f"**{analysis['trend']}**\n"
-
-            f"🎯 Score: "
-            f"**{analysis['score']}**\n"
-
-            f"🧭 Signal: "
-            f"**{analysis['signal']}**\n\n"
-
-            f"🟢 Support: "
-            f"**${analysis['support']:,.2f}**\n"
-
-            f"🔴 Resistance: "
-            f"**${analysis['resistance']:,.2f}**\n\n"
-
-            f"📊 RSI: "
-            f"**{analysis['rsi']:.2f}**\n"
-            if analysis["rsi"] is not None
-            else
-            f"📊 RSI: **-**\n"
-        )
-
-        message += (
-            f"🕯️ Pattern: "
-            f"**{analysis['pattern']}**\n\n"
-
-            "📌 ระบบนี้เป็น Technical Analysis "
-            "ไม่ใช่การรับประกันผลกำไร"
-        )
-
-        await interaction.followup.send(
-            message
-        )
-
-    except Exception as e:
-
-        print(
-            "TREND ERROR:",
-            e
-        )
-
-        await interaction.followup.send(
-            "❌ วิเคราะห์ Trend ไม่สำเร็จ"
-        )
-
-
-# =========================================================
-# MA COMMAND
-# =========================================================
-
-@bot.tree.command(
-    name="ma",
-    description="ดู EMA20 EMA50 EMA200"
-)
-async def ma(
-    interaction: discord.Interaction
-):
-
-    await interaction.response.defer()
-
-    try:
-
-        rows = fetch_yahoo_data(
-            XAU_SYMBOL,
-            "1h",
-            "90d"
         )
 
         closes = [
-            r["close"]
-            for r in rows
+            c["close"]
+            for c in candles
         ]
 
         current = closes[-1]
 
-        ema20 = ema(
+        e20 = ema(
             closes,
             20
         )
 
-        ema50 = ema(
+        e50 = ema(
             closes,
             50
         )
 
-        ema200 = ema(
+        e200 = ema(
             closes,
             200
         )
 
         message = (
 
-            "📐 **GOLD MOVING AVERAGE**\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
+            "📐 **XAU/USD EMA**\n"
 
-            f"💰 ราคา: "
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            f"⏱️ Timeframe: "
+            f"**{timeframe.value}**\n\n"
+
+            f"💰 Price: "
             f"**${current:,.2f}**\n\n"
 
-            f"EMA20: "
-            f"**${ema20:,.2f}**\n"
+            f"EMA20: **{fmt(e20)}**\n"
 
-            f"EMA50: "
-            f"**${ema50:,.2f}**\n"
+            f"EMA50: **{fmt(e50)}**\n"
 
-            f"EMA200: "
-            f"**${ema200:,.2f}**\n\n"
+            f"EMA200: **{fmt(e200)}**"
         )
-
-        if (
-            ema20
-            and ema50
-            and ema200
-        ):
-
-            if (
-                ema20 >
-                ema50 >
-                ema200
-            ):
-
-                message += (
-                    "🚀 **Bullish Structure**\n"
-                    "EMA20 > EMA50 > EMA200"
-                )
-
-            elif (
-                ema20 <
-                ema50 <
-                ema200
-            ):
-
-                message += (
-                    "🔻 **Bearish Structure**\n"
-                    "EMA20 < EMA50 < EMA200"
-                )
-
-            else:
-
-                message += (
-                    "⏸️ **Mixed Structure**"
-                )
 
         await interaction.followup.send(
             message
@@ -1785,52 +1971,53 @@ async def ma(
 
     except Exception as e:
 
-        print(
-            "MA ERROR:",
-            e
-        )
-
         await interaction.followup.send(
-            "❌ ไม่สามารถคำนวณ MA ได้"
+            "❌ EMA Error: "
+            f"`{str(e)[:500]}`"
         )
 
 
 # =========================================================
-# CHART COMMAND
+# /rsi
 # =========================================================
 
 @bot.tree.command(
-    name="chart",
-    description="ดูกราฟ XAU/USD"
+    name="rsi",
+    description="ดู RSI14"
 )
 @app_commands.describe(
-    timeframe="เลือกช่วงกราฟ"
+    timeframe="เลือก Timeframe"
 )
 @app_commands.choices(
     timeframe=[
 
         app_commands.Choice(
-            name="5 นาที",
+            name="5m",
             value="5m"
         ),
 
         app_commands.Choice(
-            name="15 นาที",
+            name="15m",
             value="15m"
         ),
 
         app_commands.Choice(
-            name="1 ชั่วโมง",
+            name="1h",
             value="1h"
         ),
 
         app_commands.Choice(
-            name="1 วัน",
+            name="4h",
+            value="4h"
+        ),
+
+        app_commands.Choice(
+            name="1d",
             value="1d"
         )
     ]
 )
-async def chart(
+async def rsi_command(
     interaction: discord.Interaction,
     timeframe: app_commands.Choice[str]
 ):
@@ -1839,348 +2026,254 @@ async def chart(
 
     try:
 
-        config = TIMEFRAMES[
-            timeframe.value
+        candles = (
+            get_timeframe_candles(
+                timeframe.value
+            )
+        )
+
+        closes = [
+            c["close"]
+            for c in candles
         ]
 
-        rows = fetch_yahoo_data(
-            XAU_SYMBOL,
-            config["interval"],
-            config["range"]
+        value = rsi(
+            closes,
+            14
         )
 
-        path = make_price_chart(
-            rows,
-            f"XAU/USD — {timeframe.value}"
-        )
+        if value is None:
 
-        if not path:
+            status = "ข้อมูลไม่พอ"
 
-            await interaction.followup.send(
-                "⚠️ สร้างกราฟไม่ได้"
-            )
+        elif value >= 70:
 
-            return
+            status = "🔴 Overbought"
 
-        await interaction.followup.send(
-            file=discord.File(path)
-        )
+        elif value <= 30:
 
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-
-    except Exception as e:
-
-        print(
-            "CHART ERROR:",
-            e
-        )
-
-        await interaction.followup.send(
-            "❌ สร้างกราฟไม่สำเร็จ"
-        )
-
-
-# =========================================================
-# AUTOMATIC ALERT
-# =========================================================
-
-@tasks.loop(
-    minutes=CHECK_INTERVAL_MINUTES
-)
-async def check_gold():
-
-    global last_alert_price
-    global last_trend_alert
-    global last_breakout_state
-
-    try:
-
-        market = get_gold_market()
-
-        price = market["price"]
-
-        usd_thb = get_usd_thb()
-
-        print(
-            datetime.now(TZ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            "XAU/USD:",
-            price
-        )
-
-        append_history(
-            market,
-            usd_thb
-        )
-
-        # =================================================
-        # PRICE ALERT
-        # =================================================
-
-        if last_alert_price is None:
-
-            last_alert_price = price
+            status = "🟢 Oversold"
 
         else:
 
-            difference = (
-                price -
-                last_alert_price
-            )
+            status = "🟡 Neutral"
 
-            if (
-                abs(difference)
-                >= ALERT_THRESHOLD
-            ):
+        message = (
 
-                icon = (
-                    "📈"
-                    if difference > 0
-                    else "📉"
-                )
+            "📊 **XAU/USD RSI14**\n"
 
-                direction = (
-                    "เพิ่มขึ้น"
-                    if difference > 0
-                    else "ลดลง"
-                )
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                message = (
+            f"Timeframe: "
+            f"**{timeframe.value}**\n\n"
 
-                    "🔔 **GOLD PRICE ALERT**\n"
-                    "━━━━━━━━━━━━━━━━━━\n\n"
+            f"RSI14: **{fmt(value)}**\n\n"
 
-                    f"{icon} XAU/USD "
-                    f"**{direction}**\n\n"
+            f"สถานะ: **{status}**"
+        )
 
-                    f"💰 ก่อนหน้า: "
-                    f"**${last_alert_price:,.2f}**\n"
-
-                    f"💰 ปัจจุบัน: "
-                    f"**${price:,.2f}**\n"
-
-                    f"📊 เปลี่ยนแปลง: "
-                    f"**{difference:+,.2f}**\n\n"
-
-                    f"💵 USD/THB: "
-                    f"**{format_usd_thb(usd_thb)}**"
-                )
-
-                await send_alert(
-                    message
-                )
-
-                last_alert_price = price
-
-        # =================================================
-        # TECHNICAL ANALYSIS
-        # =================================================
-
-        try:
-
-            config = TIMEFRAMES["15m"]
-
-            rows = fetch_yahoo_data(
-                XAU_SYMBOL,
-                config["interval"],
-                config["range"]
-            )
-
-            analysis = analyze_market(
-                rows
-            )
-
-            if analysis:
-
-                trend = analysis[
-                    "trend"
-                ]
-
-                signal = analysis[
-                    "signal"
-                ]
-
-                trend_key = (
-                    f"{trend}|{signal}"
-                )
-
-                if (
-                    last_trend_alert
-                    != trend_key
-                ):
-
-                    # แจ้งเฉพาะเมื่อเกิด signal ชัด
-                    if (
-                        "BUY" in signal
-                        or "SELL" in signal
-                    ):
-
-                        message = (
-
-                            "🧠 **GOLD TECHNICAL ALERT**\n"
-                            "━━━━━━━━━━━━━━━━━━\n\n"
-
-                            f"💰 XAU/USD: "
-                            f"**${price:,.2f}**\n\n"
-
-                            f"{trend_emoji(trend)} "
-                            f"Trend: **{trend}**\n"
-
-                            f"🎯 Score: "
-                            f"**{analysis['score']}**\n"
-
-                            f"🧭 Signal: "
-                            f"**{signal}**\n\n"
-
-                            f"📊 RSI: "
-                            f"**{analysis['rsi']:.2f}**\n"
-                            if analysis["rsi"]
-                            is not None
-                            else
-                            "📊 RSI: **-**\n"
-                        )
-
-                        message += (
-
-                            f"📐 EMA20: "
-                            f"**${analysis['ema20']:,.2f}**\n"
-
-                            f"📐 EMA50: "
-                            f"**${analysis['ema50']:,.2f}**\n"
-
-                            f"📐 EMA200: "
-                            f"**${analysis['ema200']:,.2f}**\n\n"
-
-                            f"🟢 Support: "
-                            f"**${analysis['support']:,.2f}**\n"
-
-                            f"🔴 Resistance: "
-                            f"**${analysis['resistance']:,.2f}**\n\n"
-
-                            f"🕯️ Pattern: "
-                            f"**{analysis['pattern']}**\n\n"
-
-                            "⚠️ เป็นสัญญาณจาก Technical Analysis "
-                            "ไม่ใช่คำสั่งซื้อขาย"
-                        )
-
-                        await send_alert(
-                            message
-                        )
-
-                    last_trend_alert = trend_key
-
-        except Exception as e:
-
-            print(
-                "TECHNICAL ALERT ERROR:",
-                e
-            )
+        await interaction.followup.send(
+            message
+        )
 
     except Exception as e:
 
-        print(
-            "CHECK GOLD ERROR:",
-            e
+        await interaction.followup.send(
+            "❌ RSI Error: "
+            f"`{str(e)[:500]}`"
         )
 
 
 # =========================================================
-# SEND ALERT
+# /trend
 # =========================================================
 
-async def send_alert(
-    message
+@bot.tree.command(
+    name="trend",
+    description="ดูแนวโน้ม XAU/USD"
+)
+@app_commands.describe(
+    timeframe="เลือก Timeframe"
+)
+@app_commands.choices(
+    timeframe=[
+
+        app_commands.Choice(
+            name="15m",
+            value="15m"
+        ),
+
+        app_commands.Choice(
+            name="1h",
+            value="1h"
+        ),
+
+        app_commands.Choice(
+            name="4h",
+            value="4h"
+        ),
+
+        app_commands.Choice(
+            name="1d",
+            value="1d"
+        )
+    ]
+)
+async def trend_command(
+    interaction: discord.Interaction,
+    timeframe: app_commands.Choice[str]
 ):
 
-    if ALERT_CHANNEL_ID == 0:
-        return
+    await interaction.response.defer()
 
-    channel = bot.get_channel(
-        ALERT_CHANNEL_ID
-    )
+    try:
 
-    if channel is None:
-
-        try:
-
-            channel = await bot.fetch_channel(
-                ALERT_CHANNEL_ID
+        candles = (
+            get_timeframe_candles(
+                timeframe.value
             )
+        )
 
-        except Exception as e:
+        result = analyze_candles(
+            candles,
+            timeframe.value
+        )
 
-            print(
-                "FETCH CHANNEL ERROR:",
-                e
+        if not result["ok"]:
+
+            await interaction.followup.send(
+                "⚠️ "
+                + result["message"]
             )
 
             return
 
-    try:
+        message = (
 
-        await channel.send(
+            "📈 **XAU/USD TREND**\n"
+
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            f"Timeframe: "
+            f"**{timeframe.value}**\n\n"
+
+            f"Trend: "
+            f"**{result['trend']}**\n"
+
+            f"Signal: "
+            f"**{result['signal']}**\n"
+
+            f"Score: "
+            f"**{result['score']:+d}**\n\n"
+
+            f"Price: "
+            f"**${fmt(result['current'])}**\n\n"
+
+            f"Support: "
+            f"**${fmt(result['support'])}**\n"
+
+            f"Resistance: "
+            f"**${fmt(result['resistance'])}**"
+        )
+
+        await interaction.followup.send(
             message
         )
 
-        print(
-            "ส่ง Alert สำเร็จ"
-        )
-
     except Exception as e:
 
-        print(
-            "SEND ALERT ERROR:",
-            e
+        await interaction.followup.send(
+            "❌ Trend Error: "
+            f"`{str(e)[:500]}`"
         )
 
 
 # =========================================================
-# BOT READY
+# /levels
 # =========================================================
 
-@bot.event
-async def on_ready():
+@bot.tree.command(
+    name="levels",
+    description="หาแนวรับและแนวต้าน XAU/USD"
+)
+@app_commands.describe(
+    timeframe="เลือก Timeframe"
+)
+@app_commands.choices(
+    timeframe=[
+
+        app_commands.Choice(
+            name="15m",
+            value="15m"
+        ),
+
+        app_commands.Choice(
+            name="1h",
+            value="1h"
+        ),
+
+        app_commands.Choice(
+            name="4h",
+            value="4h"
+        ),
+
+        app_commands.Choice(
+            name="1d",
+            value="1d"
+        )
+    ]
+)
+async def levels(
+    interaction: discord.Interaction,
+    timeframe: app_commands.Choice[str]
+):
+
+    await interaction.response.defer()
 
     try:
 
-        await bot.tree.sync()
+        candles = (
+            get_timeframe_candles(
+                timeframe.value
+            )
+        )
+
+        support, resistance = (
+            support_resistance(
+                candles
+            )
+        )
+
+        price = candles[-1]["close"]
+
+        await interaction.followup.send(
+
+            "🎯 **XAU/USD LEVELS**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            f"⏱️ Timeframe: "
+            f"**{timeframe.value}**\n\n"
+
+            f"💰 Price: "
+            f"**${price:,.2f}**\n\n"
+
+            f"🟢 Support: "
+            f"**${fmt(support)}**\n\n"
+
+            f"🔴 Resistance: "
+            f"**${fmt(resistance)}**"
+        )
 
     except Exception as e:
 
-        print(
-            "SYNC ERROR:",
-            e
+        await interaction.followup.send(
+            "❌ Levels Error: "
+            f"`{str(e)[:500]}`"
         )
-
-    print(
-        "=============================="
-    )
-
-    print(
-        "GOLD TRADING BOT ONLINE"
-    )
-
-    print(
-        "Bot:",
-        bot.user
-    )
-
-    print(
-        "=============================="
-    )
-
-    if not check_gold.is_running():
-
-        check_gold.start()
 
 
 # =========================================================
-# ERROR HANDLING
+# ERROR HANDLER
 # =========================================================
 
 @bot.event
@@ -2191,7 +2284,8 @@ async def on_command_error(
 
     print(
         "COMMAND ERROR:",
-        error
+        repr(error),
+        flush=True
     )
 
 
@@ -2201,25 +2295,69 @@ async def on_command_error(
 
 async def main():
 
-    discord_token = os.getenv(
-        "DISCORD_TOKEN"
+    print(
+        "DEBUG 1: เข้า main()",
+        flush=True
     )
 
-    if not discord_token:
+    if not DISCORD_TOKEN:
+
+        print(
+            "❌ DISCORD_TOKEN NOT FOUND",
+            flush=True
+        )
 
         raise RuntimeError(
             "DISCORD_TOKEN is not configured"
         )
 
-    await start_web_server()
-
-    await bot.start(
-        discord_token
+    print(
+        "DEBUG 2: พบ DISCORD_TOKEN = True",
+        flush=True
     )
 
+    print(
+        "DEBUG 3: กำลังเปิด Web Server",
+        flush=True
+    )
+
+    await start_web_server()
+
+    print(
+        "DEBUG 4: กำลังเชื่อมต่อ Discord",
+        flush=True
+    )
+
+    await bot.start(
+        DISCORD_TOKEN
+    )
+
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
 
-    asyncio.run(
-        main()
-    )
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "Bot stopped",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            "🔥 FATAL ERROR:",
+            repr(e),
+            flush=True
+        )
+
+        raise
