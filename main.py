@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import asyncio
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -40,7 +39,11 @@ from aiohttp import web
 # NO TRADE
 # DISCORD ALERT
 #
-# FREE / NO XAU API KEY
+# FIXED:
+# 1. Missing "reasons"
+# 2. Missing "buy_score"
+# 3. Missing "support"
+#
 # ============================================================
 
 
@@ -50,26 +53,50 @@ from aiohttp import web
 
 TZ = timezone(timedelta(hours=7))
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+DISCORD_TOKEN = os.getenv(
+    "DISCORD_TOKEN",
+    ""
+).strip()
 
-ALERT_CHANNEL_ID = int(
-    os.getenv("ALERT_CHANNEL_ID", "0")
-)
+try:
+    ALERT_CHANNEL_ID = int(
+        os.getenv(
+            "ALERT_CHANNEL_ID",
+            "0"
+        )
+    )
+except Exception:
+    ALERT_CHANNEL_ID = 0
+
 
 CHECK_INTERVAL_MINUTES = 2
 
-XAU_SPOT_URL = "https://xaus.com/api/v1/spot"
-XAU_INTRADAY_URL = "https://xaus.com/api/v1/intraday"
-XAU_HISTORY_URL = "https://xaus.com/api/v1/history"
+XAU_SPOT_URL = (
+    "https://xaus.com/api/v1/spot"
+)
 
-HISTORY_FILE = "xau_history_v2.json"
-SIGNAL_LOG_FILE = "signal_history_v2.json"
+XAU_INTRADAY_URL = (
+    "https://xaus.com/api/v1/intraday"
+)
+
+XAU_HISTORY_URL = (
+    "https://xaus.com/api/v1/history"
+)
+
+HISTORY_FILE = (
+    "xau_history_v2.json"
+)
+
+SIGNAL_LOG_FILE = (
+    "signal_history_v2.json"
+)
 
 HISTORY_KEEP_DAYS = 14
 
-# ------------------------------------------------------------
-# Indicator settings
-# ------------------------------------------------------------
+
+# ============================================================
+# INDICATORS
+# ============================================================
 
 EMA_FAST = 9
 EMA_MID = 21
@@ -84,9 +111,10 @@ MACD_SIGNAL = 9
 
 ATR_PERIOD = 14
 
-# ------------------------------------------------------------
-# Market structure
-# ------------------------------------------------------------
+
+# ============================================================
+# MARKET STRUCTURE
+# ============================================================
 
 SWING_LEFT = 2
 SWING_RIGHT = 2
@@ -97,29 +125,35 @@ BREAKOUT_BUFFER_ATR = 0.10
 
 RETEST_TOLERANCE_ATR = 0.30
 
-# ------------------------------------------------------------
-# Score
-# ------------------------------------------------------------
+
+# ============================================================
+# SCORE
+# ============================================================
 
 MIN_SIGNAL_SCORE = 9
+
 STRONG_SIGNAL_SCORE = 12
 
-# ------------------------------------------------------------
-# Risk
-# ------------------------------------------------------------
+
+# ============================================================
+# RISK
+# ============================================================
 
 SL_ATR_MULTIPLIER = 1.5
 
 TP1_RR = 1.5
+
 TP2_RR = 2.5
 
-# ------------------------------------------------------------
-# Alert
-# ------------------------------------------------------------
+
+# ============================================================
+# ALERT
+# ============================================================
 
 ALERT_COOLDOWN_MINUTES = 30
 
 last_alert_time = None
+
 last_alert_signal = None
 
 last_price = None
@@ -128,7 +162,7 @@ bot_start_time = datetime.now(TZ)
 
 
 # ============================================================
-# HTTP
+# HTTP SESSION
 # ============================================================
 
 session = requests.Session()
@@ -139,7 +173,9 @@ session.headers.update({
         "(Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 "
         "Chrome/120 Safari/537.36",
-    "Accept": "application/json"
+
+    "Accept":
+        "application/json"
 })
 
 
@@ -147,12 +183,16 @@ session.headers.update({
 # RENDER HEALTH SERVER
 # ============================================================
 
-async def handle_health_check(request):
+async def handle_health_check(
+    request
+):
 
     return web.json_response({
         "status": "ok",
         "service": "XAU/USD Discord Bot V2",
-        "time": datetime.now(TZ).isoformat()
+        "time": datetime.now(
+            TZ
+        ).isoformat()
     })
 
 
@@ -170,12 +210,17 @@ async def start_web_server():
         handle_health_check
     )
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(
+        app
+    )
 
     await runner.setup()
 
     port = int(
-        os.getenv("PORT", "10000")
+        os.getenv(
+            "PORT",
+            "10000"
+        )
     )
 
     site = web.TCPSite(
@@ -186,9 +231,17 @@ async def start_web_server():
 
     await site.start()
 
-    print("=" * 70)
-    print(f"WEB SERVER ACTIVE : PORT {port}")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"WEB SERVER ACTIVE : PORT {port}"
+    )
+
+    print(
+        "=" * 70
+    )
 
 
 # ============================================================
@@ -212,7 +265,9 @@ def now_thai():
     return datetime.now(TZ)
 
 
-def safe_float(value):
+def safe_float(
+    value
+):
 
     try:
 
@@ -226,23 +281,33 @@ def safe_float(value):
         return None
 
 
-def fmt_price(value):
+def fmt_price(
+    value
+):
 
     if value is None:
+
         return "N/A"
 
     return f"${value:,.2f}"
 
 
-def fmt_number(value):
+def fmt_number(
+    value
+):
 
     if value is None:
+
         return "N/A"
 
     return f"{value:,.2f}"
 
 
-def clamp(value, low, high):
+def clamp(
+    value,
+    low,
+    high
+):
 
     return max(
         low,
@@ -283,7 +348,9 @@ def get_xau_spot():
         data = response.json()
 
         price = safe_float(
-            data.get("spot_usd_oz")
+            data.get(
+                "spot_usd_oz"
+            )
         )
 
         if price is None:
@@ -294,18 +361,26 @@ def get_xau_spot():
 
         return {
             "price": price,
-            "updated_at": data.get(
-                "updated_at"
-            ),
-            "price_as_of": data.get(
-                "price_as_of"
-            ),
-            "data_state": data.get(
-                "data_state"
-            ) or {},
-            "source": data.get(
-                "price_source"
-            )
+
+            "updated_at":
+                data.get(
+                    "updated_at"
+                ),
+
+            "price_as_of":
+                data.get(
+                    "price_as_of"
+                ),
+
+            "data_state":
+                data.get(
+                    "data_state"
+                ) or {},
+
+            "source":
+                data.get(
+                    "price_source"
+                )
         }
 
     except Exception as e:
@@ -322,7 +397,9 @@ def get_xau_spot():
 # XAU INTRADAY
 # ============================================================
 
-def get_xau_intraday(hours=48):
+def get_xau_intraday(
+    hours=48
+):
 
     try:
 
@@ -355,7 +432,9 @@ def get_xau_intraday(hours=48):
 
             try:
 
-                timestamp = item.get("t")
+                timestamp = item.get(
+                    "t"
+                )
 
                 price = safe_float(
                     item.get("p")
@@ -380,7 +459,9 @@ def get_xau_intraday(hours=48):
                 else:
 
                     dt = datetime.fromisoformat(
-                        str(timestamp).replace(
+                        str(
+                            timestamp
+                        ).replace(
                             "Z",
                             "+00:00"
                         )
@@ -404,7 +485,8 @@ def get_xau_intraday(hours=48):
                 continue
 
         points.sort(
-            key=lambda x: x["time"]
+            key=lambda x:
+            x["time"]
         )
 
         return points
@@ -420,7 +502,7 @@ def get_xau_intraday(hours=48):
 
 
 # ============================================================
-# LOCAL PRICE HISTORY
+# LOCAL HISTORY
 # ============================================================
 
 def load_history():
@@ -428,6 +510,7 @@ def load_history():
     if not os.path.exists(
         HISTORY_FILE
     ):
+
         return []
 
     try:
@@ -450,7 +533,9 @@ def load_history():
         return []
 
 
-def save_history(history):
+def save_history(
+    history
+):
 
     try:
 
@@ -475,15 +560,20 @@ def save_history(history):
         )
 
 
-def append_history(price):
+def append_history(
+    price
+):
 
     history = load_history()
 
     current = now_thai()
 
     history.append({
-        "time": current.isoformat(),
-        "price": price
+        "time":
+            current.isoformat(),
+
+        "price":
+            price
     })
 
     cutoff = (
@@ -505,13 +595,17 @@ def append_history(price):
 
             if dt >= cutoff:
 
-                cleaned.append(item)
+                cleaned.append(
+                    item
+                )
 
         except Exception:
 
             pass
 
-    save_history(cleaned)
+    save_history(
+        cleaned
+    )
 
     return cleaned
 
@@ -534,7 +628,9 @@ def calculate_ema(
     )
 
     ema_value = (
-        sum(values[:period])
+        sum(
+            values[:period]
+        )
         / period
     )
 
@@ -565,6 +661,7 @@ def calculate_rsi(
         return None
 
     gains = []
+
     losses = []
 
     for i in range(
@@ -579,23 +676,35 @@ def calculate_rsi(
 
         if change > 0:
 
-            gains.append(change)
-            losses.append(0)
+            gains.append(
+                change
+            )
+
+            losses.append(
+                0
+            )
 
         else:
 
-            gains.append(0)
+            gains.append(
+                0
+            )
+
             losses.append(
                 abs(change)
             )
 
     avg_gain = (
-        sum(gains[:period])
+        sum(
+            gains[:period]
+        )
         / period
     )
 
     avg_loss = (
-        sum(losses[:period])
+        sum(
+            losses[:period]
+        )
         / period
     )
 
@@ -728,22 +837,30 @@ def calculate_atr(
         previous = candles[i - 1]
 
         high = current["high"]
+
         low = current["low"]
-        previous_close = previous["close"]
+
+        previous_close = (
+            previous["close"]
+        )
 
         tr = max(
             high - low,
+
             abs(
                 high
                 - previous_close
             ),
+
             abs(
                 low
                 - previous_close
             )
         )
 
-        true_ranges.append(tr)
+        true_ranges.append(
+            tr
+        )
 
     if len(true_ranges) < period:
 
@@ -758,7 +875,7 @@ def calculate_atr(
 
 
 # ============================================================
-# AGGREGATE SAMPLED DATA INTO CANDLES
+# AGGREGATE DATA
 # ============================================================
 
 def aggregate_candles(
@@ -786,7 +903,10 @@ def aggregate_candles(
         ) * minutes
 
         hour = bucket_start // 60
-        minute = bucket_start % 60
+
+        minute = (
+            bucket_start % 60
+        )
 
         bucket_time = dt.replace(
             hour=hour,
@@ -813,23 +933,33 @@ def aggregate_candles(
         values = buckets[key]
 
         if not values:
+
             continue
 
         candles.append({
-            "time": datetime.fromisoformat(
-                key
-            ),
-            "open": values[0],
-            "high": max(values),
-            "low": min(values),
-            "close": values[-1]
+            "time":
+                datetime.fromisoformat(
+                    key
+                ),
+
+            "open":
+                values[0],
+
+            "high":
+                max(values),
+
+            "low":
+                min(values),
+
+            "close":
+                values[-1]
         })
 
     return candles
 
 
 # ============================================================
-# SWING HIGH / LOW
+# SWINGS
 # ============================================================
 
 def find_swings(
@@ -837,13 +967,16 @@ def find_swings(
 ):
 
     swing_highs = []
+
     swing_lows = []
 
-    if len(candles) < (
+    minimum = (
         SWING_LEFT
         + SWING_RIGHT
         + 1
-    ):
+    )
+
+    if len(candles) < minimum:
 
         return (
             swing_highs,
@@ -852,7 +985,8 @@ def find_swings(
 
     for i in range(
         SWING_LEFT,
-        len(candles) - SWING_RIGHT
+        len(candles)
+        - SWING_RIGHT
     ):
 
         current = candles[i]
@@ -886,16 +1020,20 @@ def find_swings(
 
             swing_highs.append({
                 "index": i,
-                "price": current["high"],
-                "time": current["time"]
+                "price":
+                    current["high"],
+                "time":
+                    current["time"]
             })
 
         if is_low:
 
             swing_lows.append({
                 "index": i,
-                "price": current["low"],
-                "time": current["time"]
+                "price":
+                    current["low"],
+                "time":
+                    current["time"]
             })
 
     return (
@@ -913,18 +1051,26 @@ def calculate_support_resistance(
     current_price
 ):
 
+    # FIX:
+    # return ทุก key เสมอ
+    empty = {
+        "support": None,
+        "support2": None,
+        "resistance": None,
+        "resistance2": None
+    }
+
     if not candles:
 
-        return {
-            "support": None,
-            "resistance": None,
-            "support2": None,
-            "resistance2": None
-        }
+        return empty
 
     recent = candles[
         -SR_LOOKBACK:
     ]
+
+    if not recent:
+
+        return empty
 
     highs = sorted(
         [
@@ -974,29 +1120,39 @@ def calculate_support_resistance(
     )
 
     return {
-        "support": support,
-        "support2": support2,
-        "resistance": resistance,
-        "resistance2": resistance2
+        "support":
+            support,
+
+        "support2":
+            support2,
+
+        "resistance":
+            resistance,
+
+        "resistance2":
+            resistance2
     }
 
 
 # ============================================================
-# CANDLE PATTERNS
+# CANDLE PATTERN
 # ============================================================
 
 def detect_candle_pattern(
     candles
 ):
 
+    default = {
+        "name": "NONE",
+        "direction": "NONE"
+    }
+
     if len(candles) < 3:
 
-        return {
-            "name": "NONE",
-            "direction": "NONE"
-        }
+        return default
 
     c1 = candles[-1]
+
     c2 = candles[-2]
 
     body1 = abs(
@@ -1011,10 +1167,7 @@ def detect_candle_pattern(
 
     if range1 <= 0:
 
-        return {
-            "name": "NONE",
-            "direction": "NONE"
-        }
+        return default
 
     upper_wick = (
         c1["high"]
@@ -1032,50 +1185,60 @@ def detect_candle_pattern(
         - c1["low"]
     )
 
-    # --------------------------------------------------------
-    # Bullish engulfing
-    # --------------------------------------------------------
-
     bullish_engulfing = (
-        c2["close"] < c2["open"]
-        and c1["close"] > c1["open"]
-        and c1["open"] <= c2["close"]
-        and c1["close"] >= c2["open"]
+        c2["close"]
+        < c2["open"]
+        and
+        c1["close"]
+        > c1["open"]
+        and
+        c1["open"]
+        <= c2["close"]
+        and
+        c1["close"]
+        >= c2["open"]
     )
 
     if bullish_engulfing:
 
         return {
-            "name": "Bullish Engulfing",
-            "direction": "BULLISH"
+            "name":
+                "Bullish Engulfing",
+
+            "direction":
+                "BULLISH"
         }
 
-    # --------------------------------------------------------
-    # Bearish engulfing
-    # --------------------------------------------------------
-
     bearish_engulfing = (
-        c2["close"] > c2["open"]
-        and c1["close"] < c1["open"]
-        and c1["open"] >= c2["close"]
-        and c1["close"] <= c2["open"]
+        c2["close"]
+        > c2["open"]
+        and
+        c1["close"]
+        < c1["open"]
+        and
+        c1["open"]
+        >= c2["close"]
+        and
+        c1["close"]
+        <= c2["open"]
     )
 
     if bearish_engulfing:
 
         return {
-            "name": "Bearish Engulfing",
-            "direction": "BEARISH"
-        }
+            "name":
+                "Bearish Engulfing",
 
-    # --------------------------------------------------------
-    # Hammer
-    # --------------------------------------------------------
+            "direction":
+                "BEARISH"
+        }
 
     hammer = (
         lower_wick >= body1 * 2
-        and upper_wick <= body1
-        and (
+        and
+        upper_wick <= body1
+        and
+        (
             body1 / range1
         ) <= 0.5
     )
@@ -1083,18 +1246,19 @@ def detect_candle_pattern(
     if hammer:
 
         return {
-            "name": "Hammer",
-            "direction": "BULLISH"
-        }
+            "name":
+                "Hammer",
 
-    # --------------------------------------------------------
-    # Shooting star
-    # --------------------------------------------------------
+            "direction":
+                "BULLISH"
+        }
 
     shooting_star = (
         upper_wick >= body1 * 2
-        and lower_wick <= body1
-        and (
+        and
+        lower_wick <= body1
+        and
+        (
             body1 / range1
         ) <= 0.5
     )
@@ -1102,30 +1266,32 @@ def detect_candle_pattern(
     if shooting_star:
 
         return {
-            "name": "Shooting Star",
-            "direction": "BEARISH"
+            "name":
+                "Shooting Star",
+
+            "direction":
+                "BEARISH"
         }
 
-    # --------------------------------------------------------
-    # Inside bar
-    # --------------------------------------------------------
-
     inside_bar = (
-        c1["high"] <= c2["high"]
-        and c1["low"] >= c2["low"]
+        c1["high"]
+        <= c2["high"]
+        and
+        c1["low"]
+        >= c2["low"]
     )
 
     if inside_bar:
 
         return {
-            "name": "Inside Bar",
-            "direction": "NEUTRAL"
+            "name":
+                "Inside Bar",
+
+            "direction":
+                "NEUTRAL"
         }
 
-    return {
-        "name": "NONE",
-        "direction": "NONE"
-    }
+    return default
 
 
 # ============================================================
@@ -1140,18 +1306,27 @@ def calculate_fibonacci(
 
         return None
 
-    swing_highs, swing_lows = find_swings(
-        candles
+    swing_highs, swing_lows = (
+        find_swings(candles)
     )
 
-    if not swing_highs or not swing_lows:
+    if (
+        not swing_highs
+        or not swing_lows
+    ):
 
         return None
 
-    latest_high = swing_highs[-1]
-    latest_low = swing_lows[-1]
+    latest_high = (
+        swing_highs[-1]
+    )
+
+    latest_low = (
+        swing_lows[-1]
+    )
 
     high = latest_high["price"]
+
     low = latest_low["price"]
 
     if high <= low:
@@ -1161,28 +1336,31 @@ def calculate_fibonacci(
     distance = high - low
 
     return {
-        "0.0": high,
-        "23.6": high - (
-            distance * 0.236
-        ),
-        "38.2": high - (
-            distance * 0.382
-        ),
-        "50.0": high - (
-            distance * 0.500
-        ),
-        "61.8": high - (
-            distance * 0.618
-        ),
-        "78.6": high - (
-            distance * 0.786
-        ),
-        "100.0": low
+        "0.0":
+            high,
+
+        "23.6":
+            high - distance * 0.236,
+
+        "38.2":
+            high - distance * 0.382,
+
+        "50.0":
+            high - distance * 0.500,
+
+        "61.8":
+            high - distance * 0.618,
+
+        "78.6":
+            high - distance * 0.786,
+
+        "100.0":
+            low
     }
 
 
 # ============================================================
-# FIB NEAREST LEVEL
+# NEAREST FIB
 # ============================================================
 
 def nearest_fib(
@@ -1195,7 +1373,10 @@ def nearest_fib(
         return None
 
     best = None
-    best_distance = float("inf")
+
+    best_distance = float(
+        "inf"
+    )
 
     for level, value in fib.items():
 
@@ -1208,9 +1389,14 @@ def nearest_fib(
             best_distance = distance
 
             best = {
-                "level": level,
-                "price": value,
-                "distance": distance
+                "level":
+                    level,
+
+                "price":
+                    value,
+
+                "distance":
+                    distance
             }
 
     return best
@@ -1226,21 +1412,34 @@ def detect_breakout(
     atr
 ):
 
+    default = {
+        "type":
+            "NONE",
+
+        "level":
+            None,
+
+        "confirmed":
+            False
+    }
+
     if len(candles) < 3:
 
-        return {
-            "type": "NONE",
-            "level": None,
-            "confirmed": False
-        }
+        return default
 
     current = candles[-1]
+
     previous = candles[-2]
 
     close = current["close"]
 
-    resistance = sr["resistance"]
-    support = sr["support"]
+    resistance = sr.get(
+        "resistance"
+    )
+
+    support = sr.get(
+        "support"
+    )
 
     buffer = (
         atr * BREAKOUT_BUFFER_ATR
@@ -1248,47 +1447,49 @@ def detect_breakout(
         else 0
     )
 
-    # --------------------------------------------------------
-    # Bullish breakout
-    # --------------------------------------------------------
-
     if resistance is not None:
 
         if (
-            close > resistance + buffer
-            and previous["close"]
+            close
+            > resistance + buffer
+            and
+            previous["close"]
             <= resistance + buffer
         ):
 
             return {
-                "type": "BULLISH_BREAKOUT",
-                "level": resistance,
-                "confirmed": True
-            }
+                "type":
+                    "BULLISH_BREAKOUT",
 
-    # --------------------------------------------------------
-    # Bearish breakout
-    # --------------------------------------------------------
+                "level":
+                    resistance,
+
+                "confirmed":
+                    True
+            }
 
     if support is not None:
 
         if (
-            close < support - buffer
-            and previous["close"]
+            close
+            < support - buffer
+            and
+            previous["close"]
             >= support - buffer
         ):
 
             return {
-                "type": "BEARISH_BREAKOUT",
-                "level": support,
-                "confirmed": True
+                "type":
+                    "BEARISH_BREAKOUT",
+
+                "level":
+                    support,
+
+                "confirmed":
+                    True
             }
 
-    return {
-        "type": "NONE",
-        "level": None,
-        "confirmed": False
-    }
+    return default
 
 
 # ============================================================
@@ -1324,7 +1525,8 @@ def detect_retest(
                 c["low"]
                 - level
             ) <= tolerance
-            or (
+            or
+            (
                 c["low"]
                 <= level
                 <= c["high"]
@@ -1349,7 +1551,8 @@ def detect_retest(
                 c["high"]
                 - level
             ) <= tolerance
-            or (
+            or
+            (
                 c["low"]
                 <= level
                 <= c["high"]
@@ -1379,11 +1582,98 @@ def analyze_timeframe(
     label
 ):
 
+    # ========================================================
+    # FIX #1
+    # แม้ข้อมูลไม่พอ ต้อง return key ครบ
+    # ========================================================
+
     if len(candles) < 30:
 
+        current = (
+            candles[-1]["close"]
+            if candles
+            else None
+        )
+
         return {
-            "label": label,
-            "ready": False
+            "label":
+                label,
+
+            "ready":
+                False,
+
+            "candles":
+                candles,
+
+            "current":
+                current,
+
+            "ema9":
+                None,
+
+            "ema21":
+                None,
+
+            "ema50":
+                None,
+
+            "ema200":
+                None,
+
+            "rsi":
+                None,
+
+            "macd":
+                None,
+
+            "atr":
+                None,
+
+            "support":
+                None,
+
+            "support2":
+                None,
+
+            "resistance":
+                None,
+
+            "resistance2":
+                None,
+
+            "pattern": {
+                "name":
+                    "DATA NOT READY",
+
+                "direction":
+                    "NONE"
+            },
+
+            "fib":
+                None,
+
+            "nearest_fib":
+                None,
+
+            "breakout": {
+                "type":
+                    "NONE",
+
+                "level":
+                    None,
+
+                "confirmed":
+                    False
+            },
+
+            "bullish_score":
+                0,
+
+            "bearish_score":
+                0,
+
+            "trend":
+                "DATA NOT READY"
         }
 
     closes = [
@@ -1452,11 +1742,10 @@ def analyze_timeframe(
     )
 
     bullish = 0
+
     bearish = 0
 
-    # --------------------------------------------------------
     # EMA
-    # --------------------------------------------------------
 
     if (
         ema9 is not None
@@ -1497,9 +1786,7 @@ def analyze_timeframe(
 
             bearish += 2
 
-    # --------------------------------------------------------
-    # PRICE VS EMA
-    # --------------------------------------------------------
+    # Price vs EMA
 
     if ema21 is not None:
 
@@ -1511,9 +1798,7 @@ def analyze_timeframe(
 
             bearish += 1
 
-    # --------------------------------------------------------
     # RSI
-    # --------------------------------------------------------
 
     if rsi is not None:
 
@@ -1525,9 +1810,7 @@ def analyze_timeframe(
 
             bearish += 1
 
-    # --------------------------------------------------------
     # MACD
-    # --------------------------------------------------------
 
     if macd:
 
@@ -1539,9 +1822,7 @@ def analyze_timeframe(
 
             bearish += 1
 
-    # --------------------------------------------------------
-    # Candlestick
-    # --------------------------------------------------------
+    # Candle
 
     if pattern["direction"] == "BULLISH":
 
@@ -1551,21 +1832,23 @@ def analyze_timeframe(
 
         bearish += 1
 
-    # --------------------------------------------------------
     # Breakout
-    # --------------------------------------------------------
 
-    if breakout["type"] == "BULLISH_BREAKOUT":
+    if (
+        breakout["type"]
+        == "BULLISH_BREAKOUT"
+    ):
 
         bullish += 2
 
-    elif breakout["type"] == "BEARISH_BREAKOUT":
+    elif (
+        breakout["type"]
+        == "BEARISH_BREAKOUT"
+    ):
 
         bearish += 2
 
-    # --------------------------------------------------------
     # Trend
-    # --------------------------------------------------------
 
     if bullish >= bearish + 3:
 
@@ -1580,28 +1863,71 @@ def analyze_timeframe(
         trend = "SIDEWAY"
 
     return {
-        "label": label,
-        "ready": True,
-        "candles": candles,
-        "current": current,
-        "ema9": ema9,
-        "ema21": ema21,
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi": rsi,
-        "macd": macd,
-        "atr": atr,
-        "support": sr["support"],
-        "support2": sr["support2"],
-        "resistance": sr["resistance"],
-        "resistance2": sr["resistance2"],
-        "pattern": pattern,
-        "fib": fib,
-        "nearest_fib": nearest_fib_level,
-        "breakout": breakout,
-        "bullish_score": bullish,
-        "bearish_score": bearish,
-        "trend": trend
+        "label":
+            label,
+
+        "ready":
+            True,
+
+        "candles":
+            candles,
+
+        "current":
+            current,
+
+        "ema9":
+            ema9,
+
+        "ema21":
+            ema21,
+
+        "ema50":
+            ema50,
+
+        "ema200":
+            ema200,
+
+        "rsi":
+            rsi,
+
+        "macd":
+            macd,
+
+        "atr":
+            atr,
+
+        "support":
+            sr["support"],
+
+        "support2":
+            sr["support2"],
+
+        "resistance":
+            sr["resistance"],
+
+        "resistance2":
+            sr["resistance2"],
+
+        "pattern":
+            pattern,
+
+        "fib":
+            fib,
+
+        "nearest_fib":
+            nearest_fib_level,
+
+        "breakout":
+            breakout,
+
+        "bullish_score":
+            bullish,
+
+        "bearish_score":
+            bearish,
+
+        "trend":
+            trend
     }
 
 
@@ -1631,9 +1957,11 @@ def analyze_mtf(
             minutes
         )
 
-        result[label] = analyze_timeframe(
-            candles,
-            label
+        result[label] = (
+            analyze_timeframe(
+                candles,
+                label
+            )
         )
 
     return result
@@ -1648,6 +1976,7 @@ def build_global_signal(
 ):
 
     bullish_score = 0
+
     bearish_score = 0
 
     ready = 0
@@ -1659,32 +1988,49 @@ def build_global_signal(
         ("4H", 3)
     ]:
 
-        data = mtf.get(label)
+        data = mtf.get(
+            label
+        )
 
         if (
             not data
-            or not data["ready"]
+            or not data.get(
+                "ready",
+                False
+            )
         ):
+
             continue
 
         ready += 1
 
-        if data["trend"] == "BULLISH":
+        trend = data.get(
+            "trend",
+            "SIDEWAY"
+        )
+
+        if trend == "BULLISH":
 
             bullish_score += (
                 weight
                 + min(
-                    data["bullish_score"],
+                    data.get(
+                        "bullish_score",
+                        0
+                    ),
                     3
                 )
             )
 
-        elif data["trend"] == "BEARISH":
+        elif trend == "BEARISH":
 
             bearish_score += (
                 weight
                 + min(
-                    data["bearish_score"],
+                    data.get(
+                        "bearish_score",
+                        0
+                    ),
                     3
                 )
             )
@@ -1729,16 +2075,25 @@ def build_global_signal(
         signal = "NEUTRAL"
 
     return {
-        "signal": signal,
-        "bullish": bullish_score,
-        "bearish": bearish_score,
-        "confidence": confidence,
-        "ready": ready
+        "signal":
+            signal,
+
+        "bullish":
+            bullish_score,
+
+        "bearish":
+            bearish_score,
+
+        "confidence":
+            confidence,
+
+        "ready":
+            ready
     }
 
 
 # ============================================================
-# CONFLUENCE SETUP
+# TRADE SETUP
 # ============================================================
 
 def build_trade_setup(
@@ -1749,98 +2104,185 @@ def build_trade_setup(
 
     price = spot["price"]
 
-    h1 = mtf.get("1H")
-    h4 = mtf.get("4H")
-    m15 = mtf.get("15M")
+    # ========================================================
+    # FIX #2
+    # ค่า default ครบทุก key
+    # ดังนั้นไม่มี KeyError:
+    # reasons
+    # buy_score
+    # sell_score
+    # ========================================================
+
+    empty_setup = {
+        "direction":
+            "NO_TRADE",
+
+        "score":
+            0,
+
+        "buy_score":
+            0,
+
+        "sell_score":
+            0,
+
+        "reasons":
+            [],
+
+        "entry":
+            None,
+
+        "stop":
+            None,
+
+        "tp1":
+            None,
+
+        "tp2":
+            None,
+
+        "atr":
+            None
+    }
+
+    h1 = mtf.get(
+        "1H"
+    )
+
+    h4 = mtf.get(
+        "4H"
+    )
+
+    m15 = mtf.get(
+        "15M"
+    )
 
     if not h1 or not h4:
 
-        return {
-            "direction": "NO_TRADE",
-            "score": 0
-        }
+        return empty_setup
 
     if (
-        not h1["ready"]
-        or not h4["ready"]
+        not h1.get(
+            "ready",
+            False
+        )
+        or
+        not h4.get(
+            "ready",
+            False
+        )
     ):
 
-        return {
-            "direction": "NO_TRADE",
-            "score": 0
-        }
+        return empty_setup
 
     buy = 0
+
     sell = 0
 
     reasons_buy = []
+
     reasons_sell = []
 
-    # --------------------------------------------------------
+    # ========================================================
     # MTF
-    # --------------------------------------------------------
+    # ========================================================
 
-    if h4["trend"] == "BULLISH":
+    if h4.get(
+        "trend"
+    ) == "BULLISH":
 
         buy += 3
+
         reasons_buy.append(
             "4H Bullish"
         )
 
-    elif h4["trend"] == "BEARISH":
+    elif h4.get(
+        "trend"
+    ) == "BEARISH":
 
         sell += 3
+
         reasons_sell.append(
             "4H Bearish"
         )
 
-    if h1["trend"] == "BULLISH":
+    if h1.get(
+        "trend"
+    ) == "BULLISH":
 
         buy += 2
+
         reasons_buy.append(
             "1H Bullish"
         )
 
-    elif h1["trend"] == "BEARISH":
+    elif h1.get(
+        "trend"
+    ) == "BEARISH":
 
         sell += 2
+
         reasons_sell.append(
             "1H Bearish"
         )
 
     if (
         m15
-        and m15["ready"]
+        and m15.get(
+            "ready",
+            False
+        )
     ):
 
-        if m15["trend"] == "BULLISH":
+        if m15.get(
+            "trend"
+        ) == "BULLISH":
 
             buy += 1
+
             reasons_buy.append(
                 "15M Bullish"
             )
 
-        elif m15["trend"] == "BEARISH":
+        elif m15.get(
+            "trend"
+        ) == "BEARISH":
 
             sell += 1
+
             reasons_sell.append(
                 "15M Bearish"
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # EMA
-    # --------------------------------------------------------
+    # ========================================================
+
+    ema9 = h1.get(
+        "ema9"
+    )
+
+    ema21 = h1.get(
+        "ema21"
+    )
+
+    ema50 = h1.get(
+        "ema50"
+    )
 
     if (
-        h1["ema9"]
-        and h1["ema21"]
-        and h1["ema50"]
+        ema9 is not None
+        and
+        ema21 is not None
+        and
+        ema50 is not None
     ):
 
         if (
-            h1["ema9"]
-            > h1["ema21"]
-            > h1["ema50"]
+            ema9
+            > ema21
+            > ema50
         ):
 
             buy += 2
@@ -1850,9 +2292,9 @@ def build_trade_setup(
             )
 
         elif (
-            h1["ema9"]
-            < h1["ema21"]
-            < h1["ema50"]
+            ema9
+            < ema21
+            < ema50
         ):
 
             sell += 2
@@ -1861,72 +2303,87 @@ def build_trade_setup(
                 "EMA Alignment"
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # RSI
-    # --------------------------------------------------------
+    # ========================================================
 
-    if h1["rsi"] is not None:
+    rsi = h1.get(
+        "rsi"
+    )
+
+    if rsi is not None:
 
         if (
             50
-            < h1["rsi"]
+            < rsi
             < 70
         ):
 
             buy += 1
 
             reasons_buy.append(
-                f"RSI {h1['rsi']:.1f}"
+                f"RSI {rsi:.1f}"
             )
 
         elif (
             30
-            < h1["rsi"]
+            < rsi
             < 50
         ):
 
             sell += 1
 
             reasons_sell.append(
-                f"RSI {h1['rsi']:.1f}"
+                f"RSI {rsi:.1f}"
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # MACD
-    # --------------------------------------------------------
+    # ========================================================
 
-    if h1["macd"]:
+    macd = h1.get(
+        "macd"
+    )
 
-        if (
-            h1["macd"]["histogram"]
-            > 0
-        ):
+    if macd:
 
-            buy += 1
+        histogram = macd.get(
+            "histogram"
+        )
 
-            reasons_buy.append(
-                "MACD Positive"
-            )
+        if histogram is not None:
 
-        elif (
-            h1["macd"]["histogram"]
-            < 0
-        ):
+            if histogram > 0:
 
-            sell += 1
+                buy += 1
 
-            reasons_sell.append(
-                "MACD Negative"
-            )
+                reasons_buy.append(
+                    "MACD Positive"
+                )
 
-    # --------------------------------------------------------
-    # Breakout
-    # --------------------------------------------------------
+            elif histogram < 0:
 
-    breakout = h1["breakout"]
+                sell += 1
+
+                reasons_sell.append(
+                    "MACD Negative"
+                )
+
+    # ========================================================
+    # BREAKOUT
+    # ========================================================
+
+    breakout = h1.get(
+        "breakout"
+    ) or {}
+
+    breakout_type = breakout.get(
+        "type",
+        "NONE"
+    )
 
     if (
-        breakout["type"]
+        breakout_type
         == "BULLISH_BREAKOUT"
     ):
 
@@ -1937,7 +2394,7 @@ def build_trade_setup(
         )
 
     elif (
-        breakout["type"]
+        breakout_type
         == "BEARISH_BREAKOUT"
     ):
 
@@ -1947,87 +2404,139 @@ def build_trade_setup(
             "Support Breakout"
         )
 
-    # --------------------------------------------------------
-    # Retest
-    # --------------------------------------------------------
+    # ========================================================
+    # RETEST
+    # ========================================================
 
-    if breakout["confirmed"]:
+    if breakout.get(
+        "confirmed",
+        False
+    ):
 
-        level = breakout["level"]
+        level = breakout.get(
+            "level"
+        )
+
+        atr = h1.get(
+            "atr"
+        )
+
+        candles = h1.get(
+            "candles",
+            []
+        )
 
         if (
-            breakout["type"]
-            == "BULLISH_BREAKOUT"
+            level is not None
+            and candles
         ):
 
-            if detect_retest(
-                h1["candles"],
-                level,
-                "BULLISH",
-                h1["atr"]
+            if (
+                breakout_type
+                == "BULLISH_BREAKOUT"
             ):
 
-                buy += 2
+                if detect_retest(
+                    candles,
+                    level,
+                    "BULLISH",
+                    atr
+                ):
 
-                reasons_buy.append(
-                    "Breakout Retest"
-                )
+                    buy += 2
 
-        elif (
-            breakout["type"]
-            == "BEARISH_BREAKOUT"
-        ):
+                    reasons_buy.append(
+                        "Breakout Retest"
+                    )
 
-            if detect_retest(
-                h1["candles"],
-                level,
-                "BEARISH",
-                h1["atr"]
+            elif (
+                breakout_type
+                == "BEARISH_BREAKOUT"
             ):
 
-                sell += 2
+                if detect_retest(
+                    candles,
+                    level,
+                    "BEARISH",
+                    atr
+                ):
 
-                reasons_sell.append(
-                    "Breakout Retest"
-                )
+                    sell += 2
 
-    # --------------------------------------------------------
-    # Candlestick
-    # --------------------------------------------------------
+                    reasons_sell.append(
+                        "Breakout Retest"
+                    )
 
-    pattern = h1["pattern"]
+    # ========================================================
+    # CANDLE PATTERN
+    # ========================================================
 
-    if pattern["direction"] == "BULLISH":
+    pattern = h1.get(
+        "pattern"
+    ) or {}
+
+    pattern_direction = pattern.get(
+        "direction",
+        "NONE"
+    )
+
+    pattern_name = pattern.get(
+        "name",
+        "NONE"
+    )
+
+    if (
+        pattern_direction
+        == "BULLISH"
+    ):
 
         buy += 1
 
         reasons_buy.append(
-            pattern["name"]
+            pattern_name
         )
 
-    elif pattern["direction"] == "BEARISH":
+    elif (
+        pattern_direction
+        == "BEARISH"
+    ):
 
         sell += 1
 
         reasons_sell.append(
-            pattern["name"]
+            pattern_name
         )
 
-    # --------------------------------------------------------
-    # Support / Resistance
-    # --------------------------------------------------------
+    # ========================================================
+    # SUPPORT / RESISTANCE
+    # ========================================================
 
-    if h1["support"] is not None:
+    support = h1.get(
+        "support"
+    )
+
+    resistance = h1.get(
+        "resistance"
+    )
+
+    atr = h1.get(
+        "atr"
+    )
+
+    if (
+        support is not None
+        and atr
+    ):
 
         support_distance = (
             price
-            - h1["support"]
+            - support
         )
 
         if (
-            h1["atr"]
-            and 0 <= support_distance
-            <= h1["atr"] * 1.0
+            0
+            <= support_distance
+            <= atr
         ):
 
             buy += 2
@@ -2036,17 +2545,20 @@ def build_trade_setup(
                 "Near Support"
             )
 
-    if h1["resistance"] is not None:
+    if (
+        resistance is not None
+        and atr
+    ):
 
         resistance_distance = (
-            h1["resistance"]
+            resistance
             - price
         )
 
         if (
-            h1["atr"]
-            and 0 <= resistance_distance
-            <= h1["atr"] * 1.0
+            0
+            <= resistance_distance
+            <= atr
         ):
 
             sell += 2
@@ -2055,32 +2567,46 @@ def build_trade_setup(
                 "Near Resistance"
             )
 
-    # --------------------------------------------------------
-    # Fibonacci
-    # --------------------------------------------------------
+    # ========================================================
+    # FIBONACCI
+    # ========================================================
 
-    if h1["nearest_fib"]:
+    nearest_fib = h1.get(
+        "nearest_fib"
+    )
 
-        fib_distance = (
-            h1["nearest_fib"]["distance"]
+    if (
+        nearest_fib
+        and atr
+    ):
+
+        fib_price = nearest_fib.get(
+            "price"
+        )
+
+        fib_distance = nearest_fib.get(
+            "distance"
+        )
+
+        fib_level = nearest_fib.get(
+            "level"
         )
 
         if (
-            h1["atr"]
-            and fib_distance
-            <= h1["atr"] * 0.35
+            fib_price is not None
+            and
+            fib_distance is not None
+            and
+            fib_distance
+            <= atr * 0.35
         ):
 
-            level = (
-                h1["nearest_fib"]["level"]
-            )
-
-            if price > h1["nearest_fib"]["price"]:
+            if price > fib_price:
 
                 buy += 1
 
                 reasons_buy.append(
-                    f"Fib {level}%"
+                    f"Fib {fib_level}%"
                 )
 
             else:
@@ -2088,16 +2614,17 @@ def build_trade_setup(
                 sell += 1
 
                 reasons_sell.append(
-                    f"Fib {level}%"
+                    f"Fib {fib_level}%"
                 )
 
-    # --------------------------------------------------------
-    # Final direction
-    # --------------------------------------------------------
+    # ========================================================
+    # FINAL DIRECTION
+    # ========================================================
 
     if (
         buy >= MIN_SIGNAL_SCORE
-        and buy >= sell + 3
+        and
+        buy >= sell + 3
     ):
 
         direction = "BUY"
@@ -2108,7 +2635,8 @@ def build_trade_setup(
 
     elif (
         sell >= MIN_SIGNAL_SCORE
-        and sell >= buy + 3
+        and
+        sell >= buy + 3
     ):
 
         direction = "SELL"
@@ -2126,26 +2654,33 @@ def build_trade_setup(
             sell
         )
 
-        reasons = (
-            reasons_buy
-            if buy > sell
-            else reasons_sell
-        )
+        if buy > sell:
 
-    # --------------------------------------------------------
-    # Risk calculation
-    # --------------------------------------------------------
+            reasons = reasons_buy
 
-    atr = h1["atr"]
+        elif sell > buy:
+
+            reasons = reasons_sell
+
+        else:
+
+            reasons = []
+
+    # ========================================================
+    # RISK
+    # ========================================================
 
     entry = price
 
     stop = None
+
     tp1 = None
+
     tp2 = None
 
     if (
-        direction in (
+        direction
+        in (
             "BUY",
             "SELL"
         )
@@ -2154,20 +2689,23 @@ def build_trade_setup(
 
         if direction == "BUY":
 
-            structural_stop = (
-                h1["support"]
-                if h1["support"] is not None
-                else entry - (
-                    atr * 1.5
+            if support is not None:
+
+                structural_stop = (
+                    support
                 )
-            )
+
+            else:
+
+                structural_stop = (
+                    entry
+                    - atr * 1.5
+                )
 
             atr_stop = (
                 entry
-                - (
-                    atr
-                    * SL_ATR_MULTIPLIER
-                )
+                - atr
+                * SL_ATR_MULTIPLIER
             )
 
             stop = min(
@@ -2176,14 +2714,11 @@ def build_trade_setup(
             )
 
             risk = (
-                entry - stop
+                entry
+                - stop
             )
 
-            if risk <= 0:
-
-                direction = "NO_TRADE"
-
-            else:
+            if risk > 0:
 
                 tp1 = (
                     entry
@@ -2195,22 +2730,29 @@ def build_trade_setup(
                     + risk * TP2_RR
                 )
 
+            else:
+
+                direction = "NO_TRADE"
+
         else:
 
-            structural_stop = (
-                h1["resistance"]
-                if h1["resistance"] is not None
-                else entry + (
-                    atr * 1.5
+            if resistance is not None:
+
+                structural_stop = (
+                    resistance
                 )
-            )
+
+            else:
+
+                structural_stop = (
+                    entry
+                    + atr * 1.5
+                )
 
             atr_stop = (
                 entry
-                + (
-                    atr
-                    * SL_ATR_MULTIPLIER
-                )
+                + atr
+                * SL_ATR_MULTIPLIER
             )
 
             stop = max(
@@ -2219,14 +2761,11 @@ def build_trade_setup(
             )
 
             risk = (
-                stop - entry
+                stop
+                - entry
             )
 
-            if risk <= 0:
-
-                direction = "NO_TRADE"
-
-            else:
+            if risk > 0:
 
                 tp1 = (
                     entry
@@ -2238,24 +2777,50 @@ def build_trade_setup(
                     - risk * TP2_RR
                 )
 
+            else:
+
+                direction = "NO_TRADE"
+
     if direction == "NO_TRADE":
 
         entry = None
+
         stop = None
+
         tp1 = None
+
         tp2 = None
 
     return {
-        "direction": direction,
-        "score": score,
-        "buy_score": buy,
-        "sell_score": sell,
-        "reasons": reasons,
-        "entry": entry,
-        "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "atr": atr
+        "direction":
+            direction,
+
+        "score":
+            score,
+
+        "buy_score":
+            buy,
+
+        "sell_score":
+            sell,
+
+        "reasons":
+            reasons,
+
+        "entry":
+            entry,
+
+        "stop":
+            stop,
+
+        "tp1":
+            tp1,
+
+        "tp2":
+            tp2,
+
+        "atr":
+            atr
     }
 
 
@@ -2345,23 +2910,74 @@ def record_signal(
     log = load_signal_log()
 
     log.append({
-        "time": now_thai().isoformat(),
-        "price": spot["price"],
-        "direction": setup["direction"],
-        "score": setup["score"],
-        "buy_score": setup["buy_score"],
-        "sell_score": setup["sell_score"],
-        "entry": setup["entry"],
-        "stop": setup["stop"],
-        "tp1": setup["tp1"],
-        "tp2": setup["tp2"],
-        "global_signal": global_signal["signal"],
-        "confidence": global_signal["confidence"]
+        "time":
+            now_thai().isoformat(),
+
+        "price":
+            spot["price"],
+
+        "direction":
+            setup.get(
+                "direction",
+                "NO_TRADE"
+            ),
+
+        "score":
+            setup.get(
+                "score",
+                0
+            ),
+
+        "buy_score":
+            setup.get(
+                "buy_score",
+                0
+            ),
+
+        "sell_score":
+            setup.get(
+                "sell_score",
+                0
+            ),
+
+        "entry":
+            setup.get(
+                "entry"
+            ),
+
+        "stop":
+            setup.get(
+                "stop"
+            ),
+
+        "tp1":
+            setup.get(
+                "tp1"
+            ),
+
+        "tp2":
+            setup.get(
+                "tp2"
+            ),
+
+        "global_signal":
+            global_signal.get(
+                "signal",
+                "NEUTRAL"
+            ),
+
+        "confidence":
+            global_signal.get(
+                "confidence",
+                0
+            )
     })
 
     log = log[-500:]
 
-    save_signal_log(log)
+    save_signal_log(
+        log
+    )
 
 
 # ============================================================
@@ -2393,8 +3009,10 @@ def get_full_analysis():
         points
     )
 
-    global_signal = build_global_signal(
-        mtf
+    global_signal = (
+        build_global_signal(
+            mtf
+        )
     )
 
     setup = build_trade_setup(
@@ -2413,7 +3031,7 @@ def get_full_analysis():
 
 
 # ============================================================
-# FORMAT HELPERS
+# FORMAT
 # ============================================================
 
 def trend_icon(
@@ -2427,6 +3045,10 @@ def trend_icon(
     if trend == "BEARISH":
 
         return "🔴"
+
+    if trend == "DATA NOT READY":
+
+        return "⚠️"
 
     return "🟡"
 
@@ -2450,39 +3072,78 @@ def format_tf(
     data
 ):
 
-    if not data["ready"]:
+    label = data.get(
+        "label",
+        "TF"
+    )
+
+    if not data.get(
+        "ready",
+        False
+    ):
 
         return (
-            f"**{data['label']}** "
+            f"**{label}** "
             "⚠️ DATA NOT READY"
         )
 
-    rsi = (
-        f"{data['rsi']:.1f}"
-        if data["rsi"] is not None
-        else "N/A"
+    rsi = data.get(
+        "rsi"
     )
+
+    if rsi is not None:
+
+        rsi_text = f"{rsi:.1f}"
+
+    else:
+
+        rsi_text = "N/A"
 
     macd_text = "N/A"
 
-    if data["macd"]:
+    macd = data.get(
+        "macd"
+    )
 
-        macd_text = (
-            f"{data['macd']['histogram']:.2f}"
+    if macd:
+
+        histogram = macd.get(
+            "histogram"
         )
 
+        if histogram is not None:
+
+            macd_text = (
+                f"{histogram:.2f}"
+            )
+
     return (
-        f"{trend_icon(data['trend'])} "
-        f"**{data['label']} "
-        f"{data['trend']}**\n"
-        f"Price `{fmt_price(data['current'])}` | "
-        f"RSI `{rsi}` | "
-        f"MACD Hist `{macd_text}`\n"
-        f"EMA9 `{fmt_price(data['ema9'])}` | "
-        f"EMA21 `{fmt_price(data['ema21'])}` | "
-        f"EMA50 `{fmt_price(data['ema50'])}`\n"
-        f"Support `{fmt_price(data['support'])}` | "
-        f"Resistance `{fmt_price(data['resistance'])}`"
+        f"{trend_icon(data.get('trend'))} "
+        f"**{label} "
+        f"{data.get('trend', 'UNKNOWN')}**\n"
+
+        f"Price "
+        f"`{fmt_price(data.get('current'))}` | "
+
+        f"RSI `{rsi_text}` | "
+
+        f"MACD Hist "
+        f"`{macd_text}`\n"
+
+        f"EMA9 "
+        f"`{fmt_price(data.get('ema9'))}` | "
+
+        f"EMA21 "
+        f"`{fmt_price(data.get('ema21'))}` | "
+
+        f"EMA50 "
+        f"`{fmt_price(data.get('ema50'))}`\n"
+
+        f"Support "
+        f"`{fmt_price(data.get('support'))}` | "
+
+        f"Resistance "
+        f"`{fmt_price(data.get('resistance'))}`"
     )
 
 
@@ -2499,33 +3160,40 @@ def build_analysis_message(
 
     price = spot["price"]
 
-    setup_direction = (
-        setup["direction"]
+    setup_direction = setup.get(
+        "direction",
+        "NO_TRADE"
     )
 
     if setup_direction == "BUY":
 
-        setup_text = "🟢 BUY SETUP"
+        setup_text = (
+            "🟢 BUY SETUP"
+        )
 
     elif setup_direction == "SELL":
 
-        setup_text = "🔴 SELL SETUP"
+        setup_text = (
+            "🔴 SELL SETUP"
+        )
 
     else:
 
-        setup_text = "🟡 NO TRADE"
+        setup_text = (
+            "🟡 NO TRADE"
+        )
 
     lines = [
         "🪙 **XAU/USD V2 ANALYSIS**",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
         f"💰 Price: **{fmt_price(price)}**",
-        f"🎯 Bias: **{signal_text(global_signal['signal'])}**",
-        f"📊 Confidence: **{global_signal['confidence']}%**",
+        f"🎯 Bias: **{signal_text(global_signal.get('signal', 'NEUTRAL'))}**",
+        f"📊 Confidence: **{global_signal.get('confidence', 0)}%**",
         "",
         f"🧠 Setup: **{setup_text}**",
-        f"⭐ Score: **{setup['score']}**",
-        f"Quality: **{signal_quality(setup['score'])}**",
+        f"⭐ Score: **{setup.get('score', 0)}**",
+        f"Quality: **{signal_quality(setup.get('score', 0))}**",
         "",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "📊 **MULTI TIMEFRAME**",
@@ -2541,13 +3209,25 @@ def build_analysis_message(
 
         lines.append(
             format_tf(
-                mtf[label]
+                mtf.get(
+                    label,
+                    {
+                        "label":
+                            label,
+
+                        "ready":
+                            False
+                    }
+                )
             )
         )
 
         lines.append("")
 
-    h1 = mtf["1H"]
+    h1 = mtf.get(
+        "1H",
+        {}
+    )
 
     lines.extend([
         "━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -2555,24 +3235,28 @@ def build_analysis_message(
         "",
         f"Support 1: "
         f"`{fmt_price(h1.get('support'))}`",
+
         f"Support 2: "
         f"`{fmt_price(h1.get('support2'))}`",
+
         f"Resistance 1: "
         f"`{fmt_price(h1.get('resistance'))}`",
+
         f"Resistance 2: "
         f"`{fmt_price(h1.get('resistance2'))}`",
+
         ""
     ])
 
     pattern = h1.get(
         "pattern",
         {}
-    )
+    ) or {}
 
     breakout = h1.get(
         "breakout",
         {}
-    )
+    ) or {}
 
     fib = h1.get(
         "nearest_fib"
@@ -2591,8 +3275,12 @@ def build_analysis_message(
 
         lines.extend([
             "📐 **FIBONACCI**",
-            f"Nearest: `{fib['level']}%` "
-            f"@ `{fmt_price(fib['price'])}`",
+
+            f"Nearest: "
+            f"`{fib.get('level', 'N/A')}%` "
+            f"@ "
+            f"`{fmt_price(fib.get('price'))}`",
+
             ""
         ])
 
@@ -2609,17 +3297,22 @@ def build_analysis_message(
 
         lines.extend([
             f"Entry: "
-            f"`{fmt_price(setup['entry'])}`",
+            f"`{fmt_price(setup.get('entry'))}`",
+
             f"Stop Loss: "
-            f"`{fmt_price(setup['stop'])}`",
+            f"`{fmt_price(setup.get('stop'))}`",
+
             f"TP1: "
-            f"`{fmt_price(setup['tp1'])}` "
+            f"`{fmt_price(setup.get('tp1'))}` "
             f"(1:{TP1_RR})",
+
             f"TP2: "
-            f"`{fmt_price(setup['tp2'])}` "
+            f"`{fmt_price(setup.get('tp2'))}` "
             f"(1:{TP2_RR})",
+
             f"ATR: "
-            f"`{fmt_price(setup['atr'])}`",
+            f"`{fmt_price(setup.get('atr'))}`",
+
             ""
         ])
 
@@ -2631,13 +3324,18 @@ def build_analysis_message(
             ""
         ])
 
-    if setup["reasons"]:
+    reasons = setup.get(
+        "reasons",
+        []
+    ) or []
+
+    if reasons:
 
         lines.append(
             "🔎 **CONFLUENCE**"
         )
 
-        for reason in setup["reasons"][:12]:
+        for reason in reasons[:12]:
 
             lines.append(
                 f"• {reason}"
@@ -2652,7 +3350,9 @@ def build_analysis_message(
         "ราคา XAU/USD จาก API เป็น indicative spot ไม่ใช่ราคา execution"
     ])
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2666,19 +3366,31 @@ def build_alert_message(
     setup
 ):
 
-    direction = setup["direction"]
+    direction = setup.get(
+        "direction",
+        "NO_TRADE"
+    )
 
     if direction == "BUY":
 
-        title = "🟢 HIGH QUALITY BUY SETUP"
+        title = (
+            "🟢 HIGH QUALITY BUY SETUP"
+        )
 
     elif direction == "SELL":
 
-        title = "🔴 HIGH QUALITY SELL SETUP"
+        title = (
+            "🔴 HIGH QUALITY SELL SETUP"
+        )
 
     else:
 
         return None
+
+    h1 = mtf.get(
+        "1H",
+        {}
+    )
 
     lines = [
         "🚨 **XAU/USD V2 ALERT**",
@@ -2687,8 +3399,8 @@ def build_alert_message(
         f"**{title}**",
         "",
         f"💰 Price: **{fmt_price(spot['price'])}**",
-        f"⭐ Score: **{setup['score']}**",
-        f"📊 Confidence: **{global_signal['confidence']}%**",
+        f"⭐ Score: **{setup.get('score', 0)}**",
+        f"📊 Confidence: **{global_signal.get('confidence', 0)}%**",
         "",
         "📊 **MTF**"
     ]
@@ -2700,42 +3412,71 @@ def build_alert_message(
         "4H"
     ]:
 
-        data = mtf[label]
+        data = mtf.get(
+            label
+        )
 
-        if data["ready"]:
+        if data and data.get(
+            "ready",
+            False
+        ):
 
             lines.append(
-                f"{trend_icon(data['trend'])} "
-                f"{label}: **{data['trend']}**"
+                f"{trend_icon(data.get('trend'))} "
+                f"{label}: "
+                f"**{data.get('trend')}**"
             )
 
     lines.extend([
         "",
         "🧱 **LEVELS**",
-        f"Support: `{fmt_price(mtf['1H']['support'])}`",
-        f"Resistance: `{fmt_price(mtf['1H']['resistance'])}`",
+        f"Support: "
+        f"`{fmt_price(h1.get('support'))}`",
+
+        f"Resistance: "
+        f"`{fmt_price(h1.get('resistance'))}`",
+
         "",
         "🕯️ **PATTERN**",
-        f"`{mtf['1H']['pattern']['name']}`",
+        f"`{(h1.get('pattern') or {}).get('name', 'NONE')}`",
+
         "",
         "🚀 **STRUCTURE**",
-        f"`{mtf['1H']['breakout']['type']}`",
+        f"`{(h1.get('breakout') or {}).get('type', 'NONE')}`",
+
         ""
     ])
 
-    if setup["entry"]:
+    if setup.get(
+        "entry"
+    ):
 
         lines.extend([
             "🛡️ **RISK PLAN**",
-            f"Entry: `{fmt_price(setup['entry'])}`",
-            f"SL: `{fmt_price(setup['stop'])}`",
-            f"TP1: `{fmt_price(setup['tp1'])}`",
-            f"TP2: `{fmt_price(setup['tp2'])}`",
+
+            f"Entry: "
+            f"`{fmt_price(setup.get('entry'))}`",
+
+            f"SL: "
+            f"`{fmt_price(setup.get('stop'))}`",
+
+            f"TP1: "
+            f"`{fmt_price(setup.get('tp1'))}`",
+
+            f"TP2: "
+            f"`{fmt_price(setup.get('tp2'))}`",
+
             "",
+
             "🔎 **CONFIRMATIONS**"
         ])
 
-        for reason in setup["reasons"][:10]:
+        for reason in (
+            setup.get(
+                "reasons",
+                []
+            ) or []
+        )[:10]:
 
             lines.append(
                 f"• {reason}"
@@ -2748,7 +3489,9 @@ def build_alert_message(
         "ไม่ใช่คำสั่งให้เปิดออเดอร์อัตโนมัติ"
     ])
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -2776,6 +3519,7 @@ def make_chart(
     ]
 
     ema9 = []
+
     ema21 = []
 
     for i in range(
@@ -2861,7 +3605,9 @@ def make_chart(
 
     fig.tight_layout()
 
-    path = "xau_v2_chart.png"
+    path = (
+        "xau_v2_chart.png"
+    )
 
     fig.savefig(
         path
@@ -2900,16 +3646,27 @@ async def gold(
 
             return
 
-        state = spot["data_state"]
+        state = (
+            spot.get(
+                "data_state",
+                {}
+            )
+            or {}
+        )
 
         await interaction.followup.send(
             "🪙 **XAU/USD**\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 Price: **{fmt_price(spot['price'])}**\n"
+
+            f"💰 Price: "
+            f"**{fmt_price(spot['price'])}**\n"
+
             f"📡 Status: "
             f"`{state.get('status', 'unknown')}`\n"
+
             f"🕐 "
             f"`{now_thai().strftime('%d/%m/%Y %H:%M:%S')}`\n\n"
+
             "📌 Global gold spot price"
         )
 
@@ -2954,11 +3711,13 @@ async def xau(
             setup
         ) = result
 
-        message = build_analysis_message(
-            spot,
-            mtf,
-            global_signal,
-            setup
+        message = (
+            build_analysis_message(
+                spot,
+                mtf,
+                global_signal,
+                setup
+            )
         )
 
         await interaction.followup.send(
@@ -3054,11 +3813,16 @@ async def signal(
             get_full_analysis
         )
 
-        if setup["direction"] == "BUY":
+        direction = setup.get(
+            "direction",
+            "NO_TRADE"
+        )
+
+        if direction == "BUY":
 
             title = "🟢 BUY"
 
-        elif setup["direction"] == "SELL":
+        elif direction == "SELL":
 
             title = "🔴 SELL"
 
@@ -3069,28 +3833,68 @@ async def signal(
         message = (
             "🎯 **XAU/USD SIGNAL V2**\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 Price: **{fmt_price(spot['price'])}**\n\n"
+
+            f"💰 Price: "
+            f"**{fmt_price(spot['price'])}**\n\n"
+
             f"Signal: **{title}**\n"
-            f"Score: **{setup['score']}**\n"
-            f"Quality: **{signal_quality(setup['score'])}**\n"
-            f"Bias: **{signal_text(global_signal['signal'])}**\n"
-            f"Confidence: **{global_signal['confidence']}%**\n\n"
-            f"🟢 Buy Score: `{setup['buy_score']}`\n"
-            f"🔴 Sell Score: `{setup['sell_score']}`"
+
+            f"Score: "
+            f"**{setup.get('score', 0)}**\n"
+
+            f"Quality: "
+            f"**{signal_quality(setup.get('score', 0))}**\n"
+
+            f"Bias: "
+            f"**{signal_text(global_signal.get('signal', 'NEUTRAL'))}**\n"
+
+            f"Confidence: "
+            f"**{global_signal.get('confidence', 0)}%**\n\n"
+
+            f"🟢 Buy Score: "
+            f"`{setup.get('buy_score', 0)}`\n"
+
+            f"🔴 Sell Score: "
+            f"`{setup.get('sell_score', 0)}`"
         )
 
-        if setup["direction"] in (
+        if direction in (
             "BUY",
             "SELL"
         ):
 
             message += (
                 "\n\n🛡️ **RISK**\n"
-                f"Entry: `{fmt_price(setup['entry'])}`\n"
-                f"SL: `{fmt_price(setup['stop'])}`\n"
-                f"TP1: `{fmt_price(setup['tp1'])}`\n"
-                f"TP2: `{fmt_price(setup['tp2'])}`"
+
+                f"Entry: "
+                f"`{fmt_price(setup.get('entry'))}`\n"
+
+                f"SL: "
+                f"`{fmt_price(setup.get('stop'))}`\n"
+
+                f"TP1: "
+                f"`{fmt_price(setup.get('tp1'))}`\n"
+
+                f"TP2: "
+                f"`{fmt_price(setup.get('tp2'))}`"
             )
+
+        reasons = setup.get(
+            "reasons",
+            []
+        ) or []
+
+        if reasons:
+
+            message += (
+                "\n\n🔎 **REASONS**"
+            )
+
+            for reason in reasons[:10]:
+
+                message += (
+                    f"\n• {reason}"
+                )
 
         await interaction.followup.send(
             message
@@ -3139,7 +3943,8 @@ async def trend(
             "📊 **XAU/USD TREND V2**",
             "━━━━━━━━━━━━━━━━━━",
             "",
-            f"Price: **{fmt_price(spot['price'])}**",
+            f"Price: "
+            f"**{fmt_price(spot['price'])}**",
             ""
         ]
 
@@ -3150,33 +3955,44 @@ async def trend(
             "4H"
         ]:
 
-            data = mtf[label]
+            data = mtf.get(
+                label,
+                {}
+            )
 
-            if data["ready"]:
+            if data.get(
+                "ready",
+                False
+            ):
 
                 lines.append(
-                    f"{trend_icon(data['trend'])} "
+                    f"{trend_icon(data.get('trend'))} "
                     f"**{label}: "
-                    f"{data['trend']}**"
+                    f"{data.get('trend')}**"
                 )
 
             else:
 
                 lines.append(
-                    f"⚠️ {label}: DATA NOT READY"
+                    f"⚠️ {label}: "
+                    "DATA NOT READY"
                 )
 
         lines.extend([
             "",
             f"🎯 Bias: "
-            f"**{signal_text(global_signal['signal'])}**",
+            f"**{signal_text(global_signal.get('signal', 'NEUTRAL'))}**",
+
             f"📊 Confidence: "
-            f"**{global_signal['confidence']}%**",
+            f"**{global_signal.get('confidence', 0)}%**",
+
             "",
+
             f"🧠 Setup: "
-            f"**{setup['direction']}**",
+            f"**{setup.get('direction', 'NO_TRADE')}**",
+
             f"⭐ Score: "
-            f"**{setup['score']}**"
+            f"**{setup.get('score', 0)}**"
         ])
 
         await interaction.followup.send(
@@ -3222,7 +4038,36 @@ async def levels(
             get_full_analysis
         )
 
-        h1 = mtf["1H"]
+        # ====================================================
+        # FIX #3
+        # ใช้ .get() ป้องกัน KeyError: support
+        # ====================================================
+
+        h1 = mtf.get(
+            "1H",
+            {}
+        )
+
+        support = h1.get(
+            "support"
+        )
+
+        support2 = h1.get(
+            "support2"
+        )
+
+        resistance = h1.get(
+            "resistance"
+        )
+
+        resistance2 = h1.get(
+            "resistance2"
+        )
+
+        breakout = h1.get(
+            "breakout",
+            {}
+        ) or {}
 
         fib = h1.get(
             "fib"
@@ -3231,30 +4076,59 @@ async def levels(
         message = (
             "🧱 **XAU/USD MARKET LEVELS**\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 Current: **{fmt_price(spot['price'])}**\n\n"
+
+            f"💰 Current: "
+            f"**{fmt_price(spot['price'])}**\n\n"
+
             f"🟢 Support 1: "
-            f"**{fmt_price(h1['support'])}**\n"
+            f"**{fmt_price(support)}**\n"
+
             f"🟢 Support 2: "
-            f"**{fmt_price(h1['support2'])}**\n\n"
+            f"**{fmt_price(support2)}**\n\n"
+
             f"🔴 Resistance 1: "
-            f"**{fmt_price(h1['resistance'])}**\n"
+            f"**{fmt_price(resistance)}**\n"
+
             f"🔴 Resistance 2: "
-            f"**{fmt_price(h1['resistance2'])}**\n\n"
+            f"**{fmt_price(resistance2)}**\n\n"
+
             f"🚀 Breakout: "
-            f"`{h1['breakout']['type']}`\n\n"
+            f"`{breakout.get('type', 'NONE')}`\n\n"
         )
 
         if fib:
 
             message += (
                 "📐 **FIBONACCI**\n"
-                f"0%: `{fmt_price(fib['0.0'])}`\n"
-                f"23.6%: `{fmt_price(fib['23.6'])}`\n"
-                f"38.2%: `{fmt_price(fib['38.2'])}`\n"
-                f"50%: `{fmt_price(fib['50.0'])}`\n"
-                f"61.8%: `{fmt_price(fib['61.8'])}`\n"
-                f"78.6%: `{fmt_price(fib['78.6'])}`\n"
-                f"100%: `{fmt_price(fib['100.0'])}`"
+
+                f"0%: "
+                f"`{fmt_price(fib.get('0.0'))}`\n"
+
+                f"23.6%: "
+                f"`{fmt_price(fib.get('23.6'))}`\n"
+
+                f"38.2%: "
+                f"`{fmt_price(fib.get('38.2'))}`\n"
+
+                f"50%: "
+                f"`{fmt_price(fib.get('50.0'))}`\n"
+
+                f"61.8%: "
+                f"`{fmt_price(fib.get('61.8'))}`\n"
+
+                f"78.6%: "
+                f"`{fmt_price(fib.get('78.6'))}`\n"
+
+                f"100%: "
+                f"`{fmt_price(fib.get('100.0'))}`"
+            )
+
+        else:
+
+            message += (
+                "📐 **FIBONACCI**\n"
+                "⚠️ ยังไม่สามารถคำนวณ "
+                "Fibonacci ได้จากข้อมูลปัจจุบัน"
             )
 
         await interaction.followup.send(
@@ -3267,6 +4141,8 @@ async def levels(
             "LEVELS ERROR:",
             repr(e)
         )
+
+        traceback.print_exc()
 
         await interaction.followup.send(
             f"❌ LEVELS ERROR\n"
@@ -3313,21 +4189,34 @@ async def pattern(
             "4H"
         ]:
 
-            data = mtf[label]
+            data = mtf.get(
+                label,
+                {}
+            )
 
-            if data["ready"]:
+            if data.get(
+                "ready",
+                False
+            ):
 
-                pattern = data["pattern"]
+                pattern_data = (
+                    data.get(
+                        "pattern",
+                        {}
+                    )
+                    or {}
+                )
 
                 lines.append(
                     f"{label}: "
-                    f"**{pattern['name']}**"
+                    f"**{pattern_data.get('name', 'NONE')}**"
                 )
 
             else:
 
                 lines.append(
-                    f"{label}: DATA NOT READY"
+                    f"{label}: "
+                    "DATA NOT READY"
                 )
 
         await interaction.followup.send(
@@ -3382,12 +4271,16 @@ async def chart(
             return
 
         await interaction.followup.send(
-            file=discord.File(path)
+            file=discord.File(
+                path
+            )
         )
 
         try:
 
-            os.remove(path)
+            os.remove(
+                path
+            )
 
         except Exception:
 
@@ -3427,21 +4320,28 @@ async def status(
         uptime.total_seconds()
     )
 
-    hours = total_seconds // 3600
+    hours = (
+        total_seconds
+        // 3600
+    )
 
     minutes = (
-        total_seconds % 3600
+        total_seconds
+        % 3600
     ) // 60
 
     await interaction.response.send_message(
         "🤖 **GOLD BOT V2 STATUS**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
+
         "🟢 Discord: ONLINE\n"
         "🟢 Render: RUNNING\n"
         "🟢 XAU API: READY\n"
         "🟢 Technical Engine: READY\n"
+
         f"⏱️ Uptime: "
         f"`{hours}h {minutes}m`\n"
+
         f"⏰ Monitor: ทุก "
         f"`{CHECK_INTERVAL_MINUTES}` นาที"
     )
@@ -3462,27 +4362,39 @@ async def help_command(
     message = (
         "🪙 **GOLD BOT V2 COMMANDS**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
         "`/gold`\n"
         "ราคาปัจจุบัน XAU/USD\n\n"
+
         "`/xau`\n"
         "วิเคราะห์เต็มทุกระบบ\n\n"
+
         "`/analysis`\n"
         "EMA RSI MACD ATR MTF\n\n"
+
         "`/signal`\n"
         "BUY / SELL / NO TRADE\n\n"
+
         "`/trend`\n"
         "5M / 15M / 1H / 4H\n\n"
+
         "`/levels`\n"
         "Support / Resistance / Fibonacci\n\n"
+
         "`/pattern`\n"
         "Candlestick Pattern\n\n"
+
         "`/chart`\n"
         "กราฟ XAU/USD + EMA\n\n"
+
         "`/status`\n"
         "สถานะระบบ\n\n"
+
         "`/help`\n"
         "คำสั่งทั้งหมด\n\n"
+
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
         "🧠 EMA / RSI / MACD / ATR\n"
         "📊 Multi Timeframe\n"
         "🧱 Market Structure\n"
@@ -3545,22 +4457,22 @@ async def monitor_gold():
 
         print(
             f"BIAS: "
-            f"{global_signal['signal']}"
+            f"{global_signal.get('signal')}"
         )
 
         print(
             f"CONFIDENCE: "
-            f"{global_signal['confidence']}%"
+            f"{global_signal.get('confidence', 0)}%"
         )
 
         print(
             f"SETUP: "
-            f"{setup['direction']}"
+            f"{setup.get('direction', 'NO_TRADE')}"
         )
 
         print(
             f"SCORE: "
-            f"{setup['score']}"
+            f"{setup.get('score', 0)}"
         )
 
         if last_price is not None:
@@ -3578,21 +4490,29 @@ async def monitor_gold():
         last_price = price
 
         # ----------------------------------------------------
-        # Only send high-quality setups
+        # Only high-quality setups
         # ----------------------------------------------------
 
-        if setup["direction"] not in (
+        if setup.get(
+            "direction"
+        ) not in (
             "BUY",
             "SELL"
         ):
 
             return
 
-        if setup["score"] < MIN_SIGNAL_SCORE:
+        if setup.get(
+            "score",
+            0
+        ) < MIN_SIGNAL_SCORE:
 
             return
 
-        if global_signal["confidence"] < 65:
+        if global_signal.get(
+            "confidence",
+            0
+        ) < 65:
 
             return
 
@@ -3605,7 +4525,10 @@ async def monitor_gold():
                 - last_alert_time
             ).total_seconds() / 60
 
-            if elapsed < ALERT_COOLDOWN_MINUTES:
+            if (
+                elapsed
+                < ALERT_COOLDOWN_MINUTES
+            ):
 
                 print(
                     "ALERT COOLDOWN"
@@ -3613,12 +4536,10 @@ async def monitor_gold():
 
                 return
 
-        # ----------------------------------------------------
-        # Don't repeat exact same direction
-        # ----------------------------------------------------
-
         if (
-            setup["direction"]
+            setup.get(
+                "direction"
+            )
             == last_alert_signal
         ):
 
@@ -3627,10 +4548,6 @@ async def monitor_gold():
             )
 
             return
-
-        # ----------------------------------------------------
-        # Channel
-        # ----------------------------------------------------
 
         if not ALERT_CHANNEL_ID:
 
@@ -3648,8 +4565,10 @@ async def monitor_gold():
 
             try:
 
-                channel = await bot.fetch_channel(
-                    ALERT_CHANNEL_ID
+                channel = (
+                    await bot.fetch_channel(
+                        ALERT_CHANNEL_ID
+                    )
                 )
 
             except Exception as e:
@@ -3661,11 +4580,13 @@ async def monitor_gold():
 
                 return
 
-        message = build_alert_message(
-            spot,
-            mtf,
-            global_signal,
-            setup
+        message = (
+            build_alert_message(
+                spot,
+                mtf,
+                global_signal,
+                setup
+            )
         )
 
         if message:
@@ -3680,10 +4601,14 @@ async def monitor_gold():
                 global_signal
             )
 
-            last_alert_time = now_thai()
+            last_alert_time = (
+                now_thai()
+            )
 
             last_alert_signal = (
-                setup["direction"]
+                setup.get(
+                    "direction"
+                )
             )
 
             print(
@@ -3721,17 +4646,25 @@ async def before_monitor():
 @bot.event
 async def on_ready():
 
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
     print(
         "DISCORD BOT READY"
     )
+
     print(
         f"BOT: {bot.user}"
     )
+
     print(
         f"ID: {bot.user.id}"
     )
-    print("=" * 70)
+
+    print(
+        "=" * 70
+    )
 
     try:
 
@@ -3766,11 +4699,17 @@ async def on_ready():
 
 async def main():
 
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
     print(
         "STARTING XAU/USD GOLD DISCORD BOT V2"
     )
-    print("=" * 70)
+
+    print(
+        "=" * 70
+    )
 
     if not DISCORD_TOKEN:
 
