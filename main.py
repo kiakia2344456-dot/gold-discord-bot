@@ -1,3 +1,4 @@
+print("TEST MAIN.PY STARTED", flush=True)
 import os
 import re
 import json
