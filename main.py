@@ -541,7 +541,7 @@ def calculate_rsi_series(values, period=14):
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    rsi_series[period] = (
+    rsi_series.append(
         100.0 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
     )
 
