@@ -99,6 +99,11 @@ HISTORY_FILE = "xau_history_v3.json"
 SIGNAL_LOG_FILE = "signal_history_v3.json"
 HISTORY_KEEP_DAYS = 14
 
+# จำนวนชั่วโมงย้อนหลังที่ดึงจาก API สำหรับวิเคราะห์ MTF
+# เดิม 48 ชม. ทำให้ 4H timeframe (ต้องการ 30 แท่ง = 120 ชม.) ไม่มีวันพร้อม
+# ลองดึงมากขึ้น + เสริมด้วย local history เพื่อให้ 4H ค่อยๆ พร้อมเร็วขึ้น
+INTRADAY_HOURS = env_int("INTRADAY_HOURS", 240)
+
 # --- Indicators ---
 EMA_FAST = 9
 EMA_MID = 21
@@ -460,6 +465,38 @@ def append_history(price):
 
     save_history(cleaned)
     return cleaned
+
+
+def load_history_as_points():
+    """แปลง local history ที่บันทึกไว้ (ราคาที่ append ทุกรอบ monitor) ให้เป็น format เดียวกับ intraday points"""
+    history = load_history()
+    points = []
+
+    for item in history:
+        try:
+            dt = datetime.fromisoformat(item["time"])
+            price = safe_float(item.get("price"))
+            if price is not None:
+                points.append({"time": dt, "price": price})
+        except Exception:
+            continue
+
+    return points
+
+
+def merge_points(*point_lists):
+    """
+    รวม points จากหลายแหล่ง (API + local history) โดย dedupe ตามเวลา (ปัดวินาที)
+    เพื่อให้ 4H timeframe สะสมแท่งเทียนได้ครบ 30 แท่งเร็วขึ้น แม้ API จะจำกัดชั่วโมงย้อนหลัง
+    """
+    combined = {}
+
+    for points in point_lists:
+        for p in points:
+            key = p["time"].replace(second=0, microsecond=0).isoformat()
+            combined[key] = p  # แหล่งหลังทับแหล่งก่อน (ให้ priority กับ API สด)
+
+    return sorted(combined.values(), key=lambda x: x["time"])
 
 
 # ============================================================
@@ -1256,6 +1293,8 @@ def empty_trade_setup():
         "atr_percentile": None,
         "volatility_ok": True,
         "block_reason": None,
+        "info_note": None,
+        "h4_ready": False,
     }
 
 
@@ -1268,9 +1307,16 @@ def build_trade_setup(spot, mtf, global_signal):
 
     setup = empty_trade_setup()
 
-    if not h1 or not h4 or not h1.get("ready", False) or not h4.get("ready", False):
-        setup["block_reason"] = "ข้อมูล 1H หรือ 4H ยังไม่พร้อม (ต้องการอย่างน้อย 30 แท่ง)"
+    # เดิม: บังคับให้ 4H ต้องพร้อม (30 แท่ง = 120 ชม.) ก่อนถึงจะเทรดได้เลย
+    # ปัญหา: ถ้า API/ประวัติสะสมไม่ถึง 120 ชม. บอทจะ NO_TRADE ตลอดไปแบบไม่มีทางออก
+    # แก้ไข: ใช้แค่ 1H เป็นเงื่อนไขบังคับ ส่วน 4H ถ้ายังไม่พร้อมก็ข้ามไปก่อน
+    # (ให้เทรดจาก 1H/15M/5M ได้ระหว่างที่ข้อมูล 4H ค่อยๆ สะสมครบในพื้นหลัง)
+    if not h1 or not h1.get("ready", False):
+        setup["block_reason"] = "ข้อมูล 1H ยังไม่พร้อม (ต้องการอย่างน้อย 30 แท่ง)"
         return setup
+
+    h4_ready = bool(h4 and h4.get("ready", False))
+    info_note = None
 
     buy = 0.0
     sell = 0.0
@@ -1278,12 +1324,16 @@ def build_trade_setup(spot, mtf, global_signal):
     reasons_sell = []
 
     # ---------------- MTF Trend ----------------
-    if h4.get("trend") == "BULLISH":
-        buy += 3
-        reasons_buy.append("4H Bullish")
-    elif h4.get("trend") == "BEARISH":
-        sell += 3
-        reasons_sell.append("4H Bearish")
+    if h4_ready:
+        if h4.get("trend") == "BULLISH":
+            buy += 3
+            reasons_buy.append("4H Bullish")
+        elif h4.get("trend") == "BEARISH":
+            sell += 3
+            reasons_sell.append("4H Bearish")
+    else:
+        h4_candle_count = len((h4 or {}).get("candles", []) or [])
+        info_note = f"⏳ 4H กำลังสะสมข้อมูล ({h4_candle_count}/30 แท่ง) - เทรดจาก 1H/15M/5M ไปก่อน"
 
     if h1.get("trend") == "BULLISH":
         buy += 2
@@ -1536,6 +1586,8 @@ def build_trade_setup(spot, mtf, global_signal):
         "atr_percentile": atr_pct,
         "volatility_ok": volatility_ok,
         "block_reason": block_reason,
+        "info_note": info_note,
+        "h4_ready": h4_ready,
     }
 
 
@@ -1606,9 +1658,18 @@ def get_full_analysis():
     if spot is None:
         raise RuntimeError("ไม่สามารถดึง XAU/USD Spot ได้ (API อาจล่มชั่วคราว ลองใหม่รอบถัดไป)")
 
-    points = get_xau_intraday(hours=48)
+    api_points = get_xau_intraday(hours=INTRADAY_HOURS)
+    local_points = load_history_as_points()
+
+    # รวมข้อมูลจาก API กับข้อมูลที่บอทสะสมไว้เอง (local history)
+    # เพื่อให้ 4H timeframe (ต้องการ 120+ ชม.) พร้อมเร็วขึ้น แม้ API จะจำกัดชั่วโมงย้อนหลัง
+    points = merge_points(local_points, api_points)
+
     if len(points) < 30:
-        raise RuntimeError(f"ข้อมูล Intraday ไม่พอ: {len(points)} จุด (ต้องการอย่างน้อย 30)")
+        raise RuntimeError(
+            f"ข้อมูล Intraday ไม่พอ: {len(points)} จุด (ต้องการอย่างน้อย 30) "
+            f"- API ให้มา {len(api_points)} จุด, local history มี {len(local_points)} จุด"
+        )
 
     mtf = analyze_mtf(points)
     global_signal = build_global_signal(mtf)
@@ -1703,6 +1764,8 @@ def build_analysis_message(spot, mtf, global_signal, setup):
 
     if setup.get("block_reason"):
         lines.append(f"ℹ️ เหตุผลที่ไม่เข้าเทรด: {setup['block_reason']}")
+    if setup.get("info_note"):
+        lines.append(f"ℹ️ {setup['info_note']}")
 
     lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━", "📊 **MULTI TIMEFRAME**", ""])
 
@@ -2007,6 +2070,8 @@ async def signal(interaction: discord.Interaction):
 
         if setup.get("block_reason"):
             message += f"\n\nℹ️ {setup['block_reason']}"
+        if setup.get("info_note"):
+            message += f"\n\nℹ️ {setup['info_note']}"
 
         if direction in ("BUY", "SELL"):
             message += (
@@ -2246,6 +2311,7 @@ async def diagnose(interaction: discord.Interaction):
         f"Sell Score: `{snap.get('sell_percent', 0)}%`",
         f"Confidence: `{snap.get('confidence', 0)}%`",
         f"ATR Percentile: `{fmt_percent(snap.get('atr_percentile'))}`",
+        f"4H Timeframe พร้อมหรือยัง: `{'✅ พร้อม' if snap.get('h4_ready') else '⏳ กำลังสะสมข้อมูล'}`",
         "",
         "**เกณฑ์ที่ตั้งไว้ตอนนี้:**",
         f"MIN_SIGNAL_PERCENT = `{MIN_SIGNAL_PERCENT}%`",
@@ -2255,6 +2321,9 @@ async def diagnose(interaction: discord.Interaction):
         f"ALERT_COOLDOWN_MINUTES = `{ALERT_COOLDOWN_MINUTES}`",
         "",
     ]
+
+    if snap.get("info_note"):
+        lines.append(f"ℹ️ {snap['info_note']}")
 
     if snap.get("block_reason"):
         lines.append(f"⛔ **เหตุผลที่ไม่เข้าเงื่อนไข**: {snap['block_reason']}")
@@ -2382,6 +2451,8 @@ async def monitor_gold():
             "confidence": confidence,
             "atr_percentile": h1.get("atr_percentile"),
             "block_reason": setup.get("block_reason"),
+            "info_note": setup.get("info_note"),
+            "h4_ready": setup.get("h4_ready"),
         }
 
         # --- log ให้เห็นชัดทุกรอบ (สำคัญมากสำหรับ debug ว่าทำไมไม่แจ้งเตือน) ---
@@ -2393,6 +2464,8 @@ async def monitor_gold():
         )
         if setup.get("block_reason"):
             logger.info(f"BLOCK REASON: {setup['block_reason']}")
+        if setup.get("info_note"):
+            logger.info(f"INFO: {setup['info_note']}")
 
         if last_price is not None:
             movement = price - last_price
