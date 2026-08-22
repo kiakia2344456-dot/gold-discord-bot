@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import time
 import asyncio
 import logging
 import traceback
@@ -19,21 +20,32 @@ import matplotlib.dates as mdates
 
 from aiohttp import web
 
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread.exceptions import WorksheetNotFound, APIError
+
 
 # ============================================================
-# GOLD DISCORD BOT V3 - SMART ANALYSIS EDITION
+# GOLD DISCORD BOT V3 - SMART ANALYSIS EDITION (Google Sheets)
 # ============================================================
 #
-# สิ่งที่เพิ่มจาก V2:
-# 1. Debug logging เข้าไฟล์ (ดูได้ว่าทำไมไม่แจ้งเตือน)
-# 2. Threshold ปรับได้ผ่าน ENV VARS (ไม่ต้องแก้โค้ด)
-# 3. Normalized confluence score (0-100%) แทนคะแนนดิบ
-# 4. RSI Divergence Detection (bullish / bearish)
-# 5. Trend Strength ด้วย Linear Regression Slope
-# 6. Volatility Filter (ATR Percentile) กรอง sideways/chop
-# 7. Alert Logic ใหม่ - แจ้งซ้ำได้ถ้าสัญญาณแข็งแกร่งขึ้นจริง
-# 8. HTTP Retry + Exponential Backoff กัน error ชั่วคราว
-# 9. /config /diagnose คำสั่งใหม่สำหรับ debug เชิงลึก
+# เปลี่ยนจาก V3 เดิม:
+# - HISTORY_FILE / SIGNAL_LOG_FILE (local JSON) ถูกแทนที่ด้วย Google Sheets
+#   เพราะ Render ใช้ ephemeral disk -> restart ทีไรข้อมูลหายทุกที
+# - ข้อมูลราคาย้อนหลัง (price history) และ signal log จะถูกอ่าน/เขียนผ่าน
+#   Google Sheets API แทน ทำให้ข้อมูลอยู่ถาวรข้าม deploy / restart
+# - ใช้ in-memory cache กัน read เต็มชีทถี่เกินไป (อ่านเต็มชีทแค่ตอน start
+#   แล้ว append ทีละแถวหลังจากนั้น)
+#
+# ต้องเพิ่ม ENV VARS ใหม่ (ดูหัวข้อ CONFIG ด้านล่าง):
+#   GOOGLE_SERVICE_ACCOUNT_JSON  -> เนื้อหาไฟล์ service account JSON ทั้งไฟล์ (string)
+#   GOOGLE_SHEET_ID              -> ID ของ Google Sheet (จาก URL)
+#
+# ต้อง share Google Sheet ให้ email ของ service account (สิทธิ์ Editor) ด้วย
+#
+# ต้องเพิ่มใน requirements.txt:
+#   gspread
+#   google-auth
 #
 # ============================================================
 
@@ -95,13 +107,9 @@ XAU_SPOT_URL = "https://xaus.com/api/v1/spot"
 XAU_INTRADAY_URL = "https://xaus.com/api/v1/intraday"
 XAU_HISTORY_URL = "https://xaus.com/api/v1/history"
 
-HISTORY_FILE = "xau_history_v3.json"
-SIGNAL_LOG_FILE = "signal_history_v3.json"
 HISTORY_KEEP_DAYS = 14
 
 # จำนวนชั่วโมงย้อนหลังที่ดึงจาก API สำหรับวิเคราะห์ MTF
-# เดิม 48 ชม. ทำให้ 4H timeframe (ต้องการ 30 แท่ง = 120 ชม.) ไม่มีวันพร้อม
-# ลองดึงมากขึ้น + เสริมด้วย local history เพื่อให้ 4H ค่อยๆ พร้อมเร็วขึ้น
 INTRADAY_HOURS = env_int("INTRADAY_HOURS", 240)
 
 # --- Indicators ---
@@ -126,21 +134,18 @@ RETEST_TOLERANCE_ATR = 0.30
 DIVERGENCE_LOOKBACK = 20
 
 # --- Score / Confidence (ปรับได้ผ่าน ENV) ---
-# คะแนนดิบสูงสุดที่เป็นไปได้ในระบบ build_trade_setup ใหม่ (ใช้ normalize)
 MAX_RAW_SCORE = 24
 
-# เกณฑ์ % ของคะแนนเต็ม (0-100) แทนคะแนนดิบตายตัว - ยืดหยุ่นกว่าเดิมมาก
-MIN_SIGNAL_PERCENT = env_float("MIN_SIGNAL_PERCENT", 45.0)   # เดิมเทียบเท่า ~9/24
+MIN_SIGNAL_PERCENT = env_float("MIN_SIGNAL_PERCENT", 45.0)
 STRONG_SIGNAL_PERCENT = env_float("STRONG_SIGNAL_PERCENT", 62.0)
 
-MIN_CONFIDENCE = env_float("MIN_CONFIDENCE", 55.0)  # ลดจาก 65 -> 55 ให้ realistic ขึ้น
+MIN_CONFIDENCE = env_float("MIN_CONFIDENCE", 55.0)
 
-# ต้องนำอีกฝั่งกี่ % แต้ม (แทนค่าคงที่ +3 เดิม)
 DIRECTION_MARGIN_PERCENT = env_float("DIRECTION_MARGIN_PERCENT", 12.0)
 
 # --- Volatility filter ---
 ATR_HISTORY_LOOKBACK = env_int("ATR_HISTORY_LOOKBACK", 100)
-MIN_ATR_PERCENTILE = env_float("MIN_ATR_PERCENTILE", 20.0)  # กรองตลาดนิ่งเกินไป
+MIN_ATR_PERCENTILE = env_float("MIN_ATR_PERCENTILE", 20.0)
 
 # --- Risk ---
 SL_ATR_MULTIPLIER = env_float("SL_ATR_MULTIPLIER", 1.5)
@@ -149,20 +154,37 @@ TP2_RR = env_float("TP2_RR", 2.5)
 
 # --- Alert ---
 ALERT_COOLDOWN_MINUTES = env_int("ALERT_COOLDOWN_MINUTES", 20)
-# ถ้าสัญญาณทิศทางเดิม แต่คะแนน % เพิ่มขึ้นอย่างน้อยเท่านี้ -> อนุญาตแจ้งเตือนซ้ำ
 RE_ALERT_SCORE_INCREASE = env_float("RE_ALERT_SCORE_INCREASE", 8.0)
-# แจ้งเตือน "heartbeat" ยืนยันสัญญาณเดิมทุกกี่นาที แม้คะแนนไม่เพิ่ม (0 = ปิด)
 HEARTBEAT_MINUTES = env_int("HEARTBEAT_MINUTES", 0)
 
 HTTP_MAX_RETRIES = env_int("HTTP_MAX_RETRIES", 3)
 HTTP_BACKOFF_BASE = env_float("HTTP_BACKOFF_BASE", 1.5)
+
+# --- Google Sheets (แทนที่ local JSON file) ---
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+
+PRICE_HISTORY_SHEET_NAME = os.getenv("PRICE_HISTORY_SHEET_NAME", "PriceHistory")
+SIGNAL_HISTORY_SHEET_NAME = os.getenv("SIGNAL_HISTORY_SHEET_NAME", "SignalHistory")
+
+PRICE_HISTORY_HEADERS = ["time", "price"]
+SIGNAL_HISTORY_HEADERS = [
+    "time", "price", "direction", "score_percent", "buy_percent",
+    "sell_percent", "entry", "stop", "tp1", "tp2", "global_signal", "confidence",
+]
+
+SIGNAL_LOG_MAX_ROWS = 500
+
+# ทุกๆ กี่ครั้งที่ append แล้วให้ทำการ trim / rewrite ชีทเพื่อลบข้อมูลเก่าออก
+# (ไม่ trim ทุกรอบเพราะ rewrite ทั้งชีทสิ้นเปลือง quota - trim เป็นช่วงๆ พอ)
+PRICE_HISTORY_TRIM_EVERY = env_int("PRICE_HISTORY_TRIM_EVERY", 50)
 
 # --- Runtime state ---
 last_alert_time = None
 last_alert_signal = None
 last_alert_score_percent = 0.0
 last_price = None
-last_analysis_snapshot = None  # เก็บผลวิเคราะห์ล่าสุดไว้ debug ผ่าน /diagnose
+last_analysis_snapshot = None
 bot_start_time = datetime.now(TZ)
 
 
@@ -206,7 +228,6 @@ def http_get_json(url, params=None, timeout=15, retries=None):
 
             if attempt < retries:
                 wait = HTTP_BACKOFF_BASE ** attempt
-                import time
                 time.sleep(wait)
 
     raise RuntimeError(f"HTTP GET ล้มเหลวทั้งหมด {retries} ครั้ง: {repr(last_error)}")
@@ -252,7 +273,6 @@ def clamp(value, low, high):
 
 
 def percentile(values, pct):
-    """คำนวณ percentile แบบง่าย ไม่ต้องพึ่ง numpy"""
     if not values:
         return None
     data = sorted(values)
@@ -267,7 +287,6 @@ def percentile(values, pct):
 
 
 def linear_regression_slope(values):
-    """หา slope ของเส้นตรงที่ fit กับข้อมูล (ใช้วัดความแรงเทรนด์)"""
     n = len(values)
     if n < 2:
         return None
@@ -286,25 +305,333 @@ def linear_regression_slope(values):
 
 
 # ============================================================
+# GOOGLE SHEETS PERSISTENCE
+# ============================================================
+#
+# แนวคิด:
+# - _gs_spreadsheet / _gs_price_ws / _gs_signal_ws เป็น global handle ที่ต่อ
+#   Google Sheets ไว้ครั้งเดียวตอนบอทเริ่มทำงาน
+# - _price_history_cache / _signal_history_cache เป็น in-memory cache
+#   โหลดจากชีทมาครั้งเดียวตอน start แล้วหลังจากนั้น append ทั้งใน cache
+#   และเขียนแถวใหม่ลงชีทไปพร้อมกัน (append_row) - ไม่อ่านเต็มชีทซ้ำอีก
+#   เพื่อประหยัด Google Sheets API quota
+# - ถ้าต่อ Google Sheets ไม่ได้ (ไม่ได้ตั้ง ENV / เน็ตมีปัญหา) บอทจะยังทำงาน
+#   ต่อได้ (log warning) แต่ history/4H accumulation จะไม่ persist ข้าม restart
+# ============================================================
+
+_gs_client = None
+_gs_spreadsheet = None
+_gs_price_ws = None
+_gs_signal_ws = None
+_gs_enabled = False
+
+_price_history_cache = []   # list of {"time": iso_str, "price": float}
+_signal_history_cache = []  # list of dict ตาม SIGNAL_HISTORY_HEADERS
+
+_price_append_counter = 0
+_signal_append_counter = 0
+
+
+def init_google_sheets():
+    """ต่อ Google Sheets ครั้งเดียวตอนบอทเริ่มทำงาน (เรียกจาก main() ก่อน bot.start)"""
+    global _gs_client, _gs_spreadsheet, _gs_price_ws, _gs_signal_ws, _gs_enabled
+
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
+        logger.warning(
+            "GOOGLE_SERVICE_ACCOUNT_JSON หรือ GOOGLE_SHEET_ID ยังไม่ได้ตั้งค่า "
+            "-> ข้อมูล price/signal history จะไม่ persist ข้าม restart"
+        )
+        _gs_enabled = False
+        return
+
+    try:
+        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        _gs_client = gspread.authorize(credentials)
+        _gs_spreadsheet = _gs_client.open_by_key(GOOGLE_SHEET_ID)
+
+        _gs_price_ws = _get_or_create_worksheet(
+            _gs_spreadsheet, PRICE_HISTORY_SHEET_NAME, PRICE_HISTORY_HEADERS
+        )
+        _gs_signal_ws = _get_or_create_worksheet(
+            _gs_spreadsheet, SIGNAL_HISTORY_SHEET_NAME, SIGNAL_HISTORY_HEADERS
+        )
+
+        _gs_enabled = True
+        logger.info("=" * 70)
+        logger.info(f"GOOGLE SHEETS เชื่อมต่อสำเร็จ: {_gs_spreadsheet.title}")
+        logger.info(
+            f"  - {PRICE_HISTORY_SHEET_NAME} (price history)"
+        )
+        logger.info(
+            f"  - {SIGNAL_HISTORY_SHEET_NAME} (signal log)"
+        )
+        logger.info("=" * 70)
+
+    except Exception as e:
+        _gs_enabled = False
+        logger.error(f"GOOGLE SHEETS INIT ERROR: {repr(e)}")
+        logger.error(
+            "ตรวจสอบว่า: 1) GOOGLE_SERVICE_ACCOUNT_JSON เป็น JSON ที่ถูกต้อง "
+            "2) GOOGLE_SHEET_ID ถูกต้อง 3) แชร์ Sheet ให้ email ของ service account "
+            "เป็น Editor แล้ว"
+        )
+
+
+def _get_or_create_worksheet(spreadsheet, name, headers):
+    try:
+        ws = spreadsheet.worksheet(name)
+    except WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=name, rows=2000, cols=len(headers) + 2)
+        ws.append_row(headers, value_input_option="RAW")
+        return ws
+
+    # ถ้ามีอยู่แล้วแต่แถวแรกยังไม่ใช่ header ให้ใส่ header ให้
+    try:
+        first_row = ws.row_values(1)
+        if first_row != headers:
+            if not first_row:
+                ws.append_row(headers, value_input_option="RAW")
+    except Exception as e:
+        logger.warning(f"ตรวจสอบ header ของ worksheet '{name}' ไม่สำเร็จ: {repr(e)}")
+
+    return ws
+
+
+def _gs_retry(func, *args, retries=3, **kwargs):
+    """เรียกฟังก์ชัน gspread พร้อม retry กัน rate limit / เน็ตสะดุดชั่วคราว"""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except APIError as e:
+            last_error = e
+            logger.warning(f"GOOGLE SHEETS API ERROR (attempt {attempt}/{retries}): {repr(e)}")
+            time.sleep(1.5 * attempt)
+        except Exception as e:
+            last_error = e
+            logger.warning(f"GOOGLE SHEETS CALL ERROR (attempt {attempt}/{retries}): {repr(e)}")
+            time.sleep(1.5 * attempt)
+
+    raise RuntimeError(f"Google Sheets call ล้มเหลวทั้งหมด {retries} ครั้ง: {repr(last_error)}")
+
+
+# ---------------- Price history (แทนที่ HISTORY_FILE เดิม) ----------------
+
+def load_price_history_cache_from_sheet():
+    """โหลด price history ทั้งหมดจากชีทมาไว้ใน in-memory cache (เรียกครั้งเดียวตอน start)"""
+    global _price_history_cache
+
+    if not _gs_enabled:
+        _price_history_cache = []
+        return
+
+    try:
+        records = _gs_retry(_gs_price_ws.get_all_records)
+        cutoff = now_thai() - timedelta(days=HISTORY_KEEP_DAYS)
+        cleaned = []
+
+        for row in records:
+            try:
+                dt = datetime.fromisoformat(str(row.get("time")))
+                price = safe_float(row.get("price"))
+                if price is None:
+                    continue
+                if dt >= cutoff:
+                    cleaned.append({"time": row.get("time"), "price": price})
+            except Exception:
+                continue
+
+        _price_history_cache = cleaned
+        logger.info(f"โหลด price history จาก Google Sheets: {len(_price_history_cache)} แถว")
+
+    except Exception as e:
+        logger.error(f"โหลด price history จาก Google Sheets ล้มเหลว: {repr(e)}")
+        _price_history_cache = []
+
+
+def append_history(price):
+    """เพิ่มราคาปัจจุบันเข้า cache + เขียนลง Google Sheets (แทน append_history เดิม)"""
+    global _price_history_cache, _price_append_counter
+
+    current = now_thai()
+    entry = {"time": current.isoformat(), "price": price}
+    _price_history_cache.append(entry)
+
+    # ตัดข้อมูลเก่าเกิน HISTORY_KEEP_DAYS ออกจาก cache เสมอ (ไม่กระทบชีทจนกว่าจะ trim)
+    cutoff = current - timedelta(days=HISTORY_KEEP_DAYS)
+    _price_history_cache = [
+        x for x in _price_history_cache
+        if _safe_parse_iso(x["time"]) is not None and _safe_parse_iso(x["time"]) >= cutoff
+    ]
+
+    if not _gs_enabled:
+        return _price_history_cache
+
+    try:
+        _gs_retry(_gs_price_ws.append_row, [entry["time"], price], value_input_option="RAW")
+    except Exception as e:
+        logger.error(f"บันทึก price history ลง Google Sheets ล้มเหลว: {repr(e)}")
+
+    _price_append_counter += 1
+    if PRICE_HISTORY_TRIM_EVERY > 0 and _price_append_counter % PRICE_HISTORY_TRIM_EVERY == 0:
+        trim_price_history_sheet()
+
+    return _price_history_cache
+
+
+def trim_price_history_sheet():
+    """rewrite ทั้งชีท price history ด้วยข้อมูลใน cache (ตัดข้อมูลเก่าเกิน HISTORY_KEEP_DAYS ออก)"""
+    if not _gs_enabled:
+        return
+
+    try:
+        rows = [[x["time"], x["price"]] for x in _price_history_cache]
+        _gs_retry(_gs_price_ws.clear)
+        _gs_retry(_gs_price_ws.append_row, PRICE_HISTORY_HEADERS, value_input_option="RAW")
+        if rows:
+            _gs_retry(_gs_price_ws.append_rows, rows, value_input_option="RAW")
+        logger.info(f"TRIM price history sheet: เหลือ {len(rows)} แถว")
+    except Exception as e:
+        logger.error(f"TRIM price history sheet ล้มเหลว: {repr(e)}")
+
+
+def _safe_parse_iso(value):
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def load_history_as_points():
+    """แปลง cache (ที่โหลดจาก Google Sheets) ให้เป็น format เดียวกับ intraday points"""
+    points = []
+
+    for item in _price_history_cache:
+        dt = _safe_parse_iso(item["time"])
+        price = safe_float(item.get("price"))
+        if dt is not None and price is not None:
+            points.append({"time": dt, "price": price})
+
+    return points
+
+
+def merge_points(*point_lists):
+    """
+    รวม points จากหลายแหล่ง (API + Google Sheets history) โดย dedupe ตามเวลา (ปัดวินาที)
+    เพื่อให้ 4H timeframe สะสมแท่งเทียนได้ครบ 30 แท่งเร็วขึ้น
+    """
+    combined = {}
+
+    for points in point_lists:
+        for p in points:
+            key = p["time"].replace(second=0, microsecond=0).isoformat()
+            combined[key] = p
+
+    return sorted(combined.values(), key=lambda x: x["time"])
+
+
+# ---------------- Signal log (แทนที่ SIGNAL_LOG_FILE เดิม) ----------------
+
+def load_signal_history_cache_from_sheet():
+    global _signal_history_cache
+
+    if not _gs_enabled:
+        _signal_history_cache = []
+        return
+
+    try:
+        records = _gs_retry(_gs_signal_ws.get_all_records)
+        _signal_history_cache = records[-SIGNAL_LOG_MAX_ROWS:]
+        logger.info(f"โหลด signal log จาก Google Sheets: {len(_signal_history_cache)} แถว")
+    except Exception as e:
+        logger.error(f"โหลด signal log จาก Google Sheets ล้มเหลว: {repr(e)}")
+        _signal_history_cache = []
+
+
+def record_signal(spot, setup, global_signal):
+    """บันทึก signal ที่ถูกแจ้งเตือนแล้ว ลง cache + Google Sheets (แทน record_signal เดิม)"""
+    global _signal_history_cache, _signal_append_counter
+
+    row = {
+        "time": now_thai().isoformat(),
+        "price": spot["price"],
+        "direction": setup.get("direction", "NO_TRADE"),
+        "score_percent": setup.get("score_percent", 0),
+        "buy_percent": setup.get("buy_percent", 0),
+        "sell_percent": setup.get("sell_percent", 0),
+        "entry": setup.get("entry"),
+        "stop": setup.get("stop"),
+        "tp1": setup.get("tp1"),
+        "tp2": setup.get("tp2"),
+        "global_signal": global_signal.get("signal", "NEUTRAL"),
+        "confidence": global_signal.get("confidence", 0),
+    }
+
+    _signal_history_cache.append(row)
+    _signal_history_cache = _signal_history_cache[-SIGNAL_LOG_MAX_ROWS:]
+
+    if not _gs_enabled:
+        return
+
+    try:
+        values = [row.get(col) for col in SIGNAL_HISTORY_HEADERS]
+        values = [("" if v is None else v) for v in values]
+        _gs_retry(_gs_signal_ws.append_row, values, value_input_option="RAW")
+    except Exception as e:
+        logger.error(f"บันทึก signal log ลง Google Sheets ล้มเหลว: {repr(e)}")
+
+    _signal_append_counter += 1
+    if _signal_append_counter % 20 == 0:
+        trim_signal_history_sheet()
+
+
+def trim_signal_history_sheet():
+    """rewrite ทั้งชีท signal log ด้วยข้อมูลใน cache (เก็บแค่ SIGNAL_LOG_MAX_ROWS แถวล่าสุด)"""
+    if not _gs_enabled:
+        return
+
+    try:
+        rows = [
+            [("" if row.get(col) is None else row.get(col)) for col in SIGNAL_HISTORY_HEADERS]
+            for row in _signal_history_cache
+        ]
+        _gs_retry(_gs_signal_ws.clear)
+        _gs_retry(_gs_signal_ws.append_row, SIGNAL_HISTORY_HEADERS, value_input_option="RAW")
+        if rows:
+            _gs_retry(_gs_signal_ws.append_rows, rows, value_input_option="RAW")
+        logger.info(f"TRIM signal history sheet: เหลือ {len(rows)} แถว")
+    except Exception as e:
+        logger.error(f"TRIM signal history sheet ล้มเหลว: {repr(e)}")
+
+
+# ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
 
 async def handle_health_check(request):
     return web.json_response({
         "status": "ok",
-        "service": "XAU/USD Discord Bot V3 - Smart Analysis",
+        "service": "XAU/USD Discord Bot V3 - Smart Analysis (Google Sheets)",
         "time": now_thai().isoformat(),
+        "google_sheets": _gs_enabled,
     })
 
 
 async def handle_diagnostics(request):
-    """endpoint เพิ่มเติมสำหรับดู state ล่าสุดผ่านเบราว์เซอร์ /debug"""
     global last_analysis_snapshot, last_alert_time, last_alert_signal
 
     return web.json_response({
         "last_alert_time": last_alert_time.isoformat() if last_alert_time else None,
         "last_alert_signal": last_alert_signal,
         "last_analysis": last_analysis_snapshot or {},
+        "google_sheets_enabled": _gs_enabled,
+        "price_history_rows_cached": len(_price_history_cache),
+        "signal_history_rows_cached": len(_signal_history_cache),
         "config": {
             "MIN_SIGNAL_PERCENT": MIN_SIGNAL_PERCENT,
             "MIN_CONFIDENCE": MIN_CONFIDENCE,
@@ -424,82 +751,6 @@ def get_xau_intraday(hours=48):
 
 
 # ============================================================
-# LOCAL HISTORY
-# ============================================================
-
-def load_history():
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"HISTORY READ ERROR: {repr(e)}")
-        return []
-
-
-def save_history(history):
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"HISTORY SAVE ERROR: {repr(e)}")
-
-
-def append_history(price):
-    history = load_history()
-    current = now_thai()
-
-    history.append({"time": current.isoformat(), "price": price})
-
-    cutoff = current - timedelta(days=HISTORY_KEEP_DAYS)
-    cleaned = []
-
-    for item in history:
-        try:
-            dt = datetime.fromisoformat(item["time"])
-            if dt >= cutoff:
-                cleaned.append(item)
-        except Exception:
-            pass
-
-    save_history(cleaned)
-    return cleaned
-
-
-def load_history_as_points():
-    """แปลง local history ที่บันทึกไว้ (ราคาที่ append ทุกรอบ monitor) ให้เป็น format เดียวกับ intraday points"""
-    history = load_history()
-    points = []
-
-    for item in history:
-        try:
-            dt = datetime.fromisoformat(item["time"])
-            price = safe_float(item.get("price"))
-            if price is not None:
-                points.append({"time": dt, "price": price})
-        except Exception:
-            continue
-
-    return points
-
-
-def merge_points(*point_lists):
-    """
-    รวม points จากหลายแหล่ง (API + local history) โดย dedupe ตามเวลา (ปัดวินาที)
-    เพื่อให้ 4H timeframe สะสมแท่งเทียนได้ครบ 30 แท่งเร็วขึ้น แม้ API จะจำกัดชั่วโมงย้อนหลัง
-    """
-    combined = {}
-
-    for points in point_lists:
-        for p in points:
-            key = p["time"].replace(second=0, microsecond=0).isoformat()
-            combined[key] = p  # แหล่งหลังทับแหล่งก่อน (ให้ priority กับ API สด)
-
-    return sorted(combined.values(), key=lambda x: x["time"])
-
-
-# ============================================================
 # EMA / RSI / MACD / ATR
 # ============================================================
 
@@ -517,7 +768,6 @@ def calculate_ema(values, period):
 
 
 def calculate_ema_series(values, period):
-    """คืน EMA เป็น series (list) แทนค่าเดียว ใช้สำหรับ divergence / slope"""
     if len(values) < period:
         return []
 
@@ -563,7 +813,6 @@ def calculate_rsi(values, period=14):
 
 
 def calculate_rsi_series(values, period=14):
-    """คืน RSI เป็น series ใช้สำหรับตรวจ divergence"""
     if len(values) < period + 1:
         return []
 
@@ -644,7 +893,6 @@ def calculate_atr(candles, period=14):
 
 
 def calculate_atr_series(candles, period=14):
-    """คืน ATR เป็น series ใช้หา percentile ของความผันผวนปัจจุบันเทียบอดีต"""
     if len(candles) < period + 1:
         return []
 
@@ -668,10 +916,6 @@ def calculate_atr_series(candles, period=14):
 
 
 def calculate_atr_percentile(candles, period=14, lookback=100):
-    """
-    บอกว่า ATR ปัจจุบันอยู่ percentile ที่เท่าไหร่เทียบกับอดีต
-    ใช้กรองช่วงตลาดนิ่งเกินไป (chop) ที่สัญญาณมักหลอก
-    """
     atr_series = calculate_atr_series(candles, period)
 
     if not atr_series:
@@ -785,7 +1029,7 @@ def calculate_support_resistance(candles, current_price):
 
 
 # ============================================================
-# CANDLE PATTERN (เพิ่ม Doji, Morning/Evening Star)
+# CANDLE PATTERN
 # ============================================================
 
 def detect_candle_pattern(candles):
@@ -807,7 +1051,6 @@ def detect_candle_pattern(candles):
     upper_wick = c1["high"] - max(c1["open"], c1["close"])
     lower_wick = min(c1["open"], c1["close"]) - c1["low"]
 
-    # --- Engulfing ---
     bullish_engulfing = (
         c2["close"] < c2["open"] and c1["close"] > c1["open"]
         and c1["open"] <= c2["close"] and c1["close"] >= c2["open"]
@@ -822,7 +1065,6 @@ def detect_candle_pattern(candles):
     if bearish_engulfing:
         return {"name": "Bearish Engulfing", "direction": "BEARISH"}
 
-    # --- Morning / Evening Star (3 แท่ง) ---
     body2 = abs(c2["close"] - c2["open"])
     body3 = abs(c3["close"] - c3["open"])
     range3 = c3["high"] - c3["low"]
@@ -848,7 +1090,6 @@ def detect_candle_pattern(candles):
         if evening_star:
             return {"name": "Evening Star", "direction": "BEARISH"}
 
-    # --- Hammer / Shooting Star ---
     hammer = lower_wick >= body1 * 2 and upper_wick <= body1 and (body1 / range1) <= 0.5
     if hammer:
         return {"name": "Hammer", "direction": "BULLISH"}
@@ -857,12 +1098,10 @@ def detect_candle_pattern(candles):
     if shooting_star:
         return {"name": "Shooting Star", "direction": "BEARISH"}
 
-    # --- Doji (ความไม่แน่ใจของตลาด) ---
     doji = (body1 / range1) <= 0.1
     if doji:
         return {"name": "Doji", "direction": "NEUTRAL"}
 
-    # --- Inside Bar ---
     inside_bar = c1["high"] <= c2["high"] and c1["low"] >= c2["low"]
     if inside_bar:
         return {"name": "Inside Bar", "direction": "NEUTRAL"}
@@ -976,15 +1215,10 @@ def detect_retest(candles, level, direction, atr):
 
 
 # ============================================================
-# RSI DIVERGENCE (ใหม่ใน V3)
+# RSI DIVERGENCE
 # ============================================================
 
 def detect_rsi_divergence(candles, closes):
-    """
-    ตรวจ Bullish/Bearish Divergence ระหว่างราคากับ RSI
-    - Bullish: ราคาทำ Low ใหม่ต่ำกว่าเดิม แต่ RSI ทำ Low ใหม่สูงกว่าเดิม (โมเมนตัมอ่อนลง -> กลับตัวขึ้น)
-    - Bearish: ราคาทำ High ใหม่สูงกว่าเดิม แต่ RSI ทำ High ใหม่ต่ำกว่าเดิม (โมเมนตัมอ่อนลง -> กลับตัวลง)
-    """
     default = {"type": "NONE", "strength": 0}
 
     if len(candles) < DIVERGENCE_LOOKBACK + RSI_PERIOD:
@@ -1007,7 +1241,6 @@ def detect_rsi_divergence(candles, closes):
 
     swing_highs, swing_lows = find_swings(window_candles)
 
-    # --- Bearish divergence: price higher high, RSI lower high ---
     if len(swing_highs) >= 2:
         h1 = swing_highs[-2]
         h2 = swing_highs[-1]
@@ -1023,7 +1256,6 @@ def detect_rsi_divergence(candles, closes):
             strength = min(round((rsi_at_h1 - rsi_at_h2)), 10)
             return {"type": "BEARISH_DIVERGENCE", "strength": strength}
 
-    # --- Bullish divergence: price lower low, RSI higher low ---
     if len(swing_lows) >= 2:
         l1 = swing_lows[-2]
         l2 = swing_lows[-1]
@@ -1043,15 +1275,10 @@ def detect_rsi_divergence(candles, closes):
 
 
 # ============================================================
-# TREND STRENGTH (ใหม่ใน V3) - ใช้ linear regression slope
+# TREND STRENGTH
 # ============================================================
 
 def calculate_trend_strength(closes, atr):
-    """
-    วัดความแรงของเทรนด์จริง โดยดู slope ของราคา 20 แท่งล่าสุด
-    normalize ด้วย ATR เพื่อให้เทียบกันได้ข้ามช่วงความผันผวน
-    คืนค่า -100 ถึง +100 (บวก=เทรนด์ขึ้นแรง, ลบ=เทรนด์ลงแรง)
-    """
     if len(closes) < 20 or not atr or atr == 0:
         return 0
 
@@ -1061,13 +1288,12 @@ def calculate_trend_strength(closes, atr):
     if slope is None:
         return 0
 
-    # normalize: slope ต่อแท่ง เทียบกับ ATR (ความผันผวนเฉลี่ยต่อแท่ง)
     normalized = (slope / atr) * 100
     return clamp(normalized, -100, 100)
 
 
 # ============================================================
-# TIMEFRAME ANALYSIS (ปรับปรุงคะแนนใหม่ทั้งหมด)
+# TIMEFRAME ANALYSIS
 # ============================================================
 
 def empty_timeframe_result(label, candles):
@@ -1119,7 +1345,6 @@ def analyze_timeframe(candles, label):
     bullish = 0
     bearish = 0
 
-    # --- EMA alignment (น้ำหนักตามความสำคัญ) ---
     if ema9 is not None and ema21 is not None:
         if ema9 > ema21:
             bullish += 1
@@ -1144,49 +1369,42 @@ def analyze_timeframe(candles, label):
         elif current < ema21:
             bearish += 1
 
-    # --- RSI ---
     if rsi is not None:
         if 50 < rsi < 70:
             bullish += 1
         elif 30 < rsi < 50:
             bearish += 1
         elif rsi >= 70:
-            bearish += 0.5  # overbought เตือนความเสี่ยงกลับตัว
+            bearish += 0.5
         elif rsi <= 30:
-            bullish += 0.5  # oversold
+            bullish += 0.5
 
-    # --- MACD ---
     if macd:
         if macd["histogram"] > 0:
             bullish += 1
         elif macd["histogram"] < 0:
             bearish += 1
 
-    # --- Candle pattern ---
     if pattern["direction"] == "BULLISH":
         bullish += 1
     elif pattern["direction"] == "BEARISH":
         bearish += 1
 
-    # --- Breakout ---
     if breakout["type"] == "BULLISH_BREAKOUT":
         bullish += 2
     elif breakout["type"] == "BEARISH_BREAKOUT":
         bearish += 2
 
-    # --- Divergence (น้ำหนักสูง เพราะเป็นสัญญาณกลับตัวที่แม่นยำ) ---
     if divergence["type"] == "BULLISH_DIVERGENCE":
         bullish += 1 + (divergence["strength"] / 10)
     elif divergence["type"] == "BEARISH_DIVERGENCE":
         bearish += 1 + (divergence["strength"] / 10)
 
-    # --- Trend strength ---
     if trend_strength > 20:
         bullish += 1
     elif trend_strength < -20:
         bearish += 1
 
-    # --- Trend classification ---
     if bullish >= bearish + 3:
         trend = "BULLISH"
     elif bearish >= bullish + 3:
@@ -1249,7 +1467,6 @@ def build_global_signal(mtf):
             bearish_score += weight + min(data.get("bearish_score", 0), 3)
             aligned_bearish += 1
 
-    # --- Bonus: หลาย timeframe เห็นตรงกัน = ความมั่นใจสูงขึ้นจริง ---
     alignment_bonus = 0
     if aligned_bullish >= 3:
         bullish_score += 2
@@ -1280,7 +1497,7 @@ def build_global_signal(mtf):
 
 
 # ============================================================
-# TRADE SETUP (Normalized Scoring - ใหม่ใน V3)
+# TRADE SETUP (Normalized Scoring)
 # ============================================================
 
 def empty_trade_setup():
@@ -1307,10 +1524,6 @@ def build_trade_setup(spot, mtf, global_signal):
 
     setup = empty_trade_setup()
 
-    # เดิม: บังคับให้ 4H ต้องพร้อม (30 แท่ง = 120 ชม.) ก่อนถึงจะเทรดได้เลย
-    # ปัญหา: ถ้า API/ประวัติสะสมไม่ถึง 120 ชม. บอทจะ NO_TRADE ตลอดไปแบบไม่มีทางออก
-    # แก้ไข: ใช้แค่ 1H เป็นเงื่อนไขบังคับ ส่วน 4H ถ้ายังไม่พร้อมก็ข้ามไปก่อน
-    # (ให้เทรดจาก 1H/15M/5M ได้ระหว่างที่ข้อมูล 4H ค่อยๆ สะสมครบในพื้นหลัง)
     if not h1 or not h1.get("ready", False):
         setup["block_reason"] = "ข้อมูล 1H ยังไม่พร้อม (ต้องการอย่างน้อย 30 แท่ง)"
         return setup
@@ -1323,7 +1536,6 @@ def build_trade_setup(spot, mtf, global_signal):
     reasons_buy = []
     reasons_sell = []
 
-    # ---------------- MTF Trend ----------------
     if h4_ready:
         if h4.get("trend") == "BULLISH":
             buy += 3
@@ -1350,7 +1562,6 @@ def build_trade_setup(spot, mtf, global_signal):
             sell += 1
             reasons_sell.append("15M Bearish")
 
-    # ---------------- EMA Alignment ----------------
     ema9, ema21, ema50 = h1.get("ema9"), h1.get("ema21"), h1.get("ema50")
 
     if ema9 is not None and ema21 is not None and ema50 is not None:
@@ -1361,7 +1572,6 @@ def build_trade_setup(spot, mtf, global_signal):
             sell += 2
             reasons_sell.append("EMA Alignment (9<21<50)")
 
-    # ---------------- RSI ----------------
     rsi = h1.get("rsi")
     if rsi is not None:
         if 50 < rsi < 70:
@@ -1371,7 +1581,6 @@ def build_trade_setup(spot, mtf, global_signal):
             sell += 1
             reasons_sell.append(f"RSI {rsi:.1f}")
 
-    # ---------------- MACD ----------------
     macd = h1.get("macd")
     if macd:
         histogram = macd.get("histogram")
@@ -1383,7 +1592,6 @@ def build_trade_setup(spot, mtf, global_signal):
                 sell += 1
                 reasons_sell.append("MACD Negative")
 
-    # ---------------- Breakout ----------------
     breakout = h1.get("breakout") or {}
     breakout_type = breakout.get("type", "NONE")
 
@@ -1394,7 +1602,6 @@ def build_trade_setup(spot, mtf, global_signal):
         sell += 2
         reasons_sell.append("Support Breakout")
 
-    # ---------------- Retest ----------------
     if breakout.get("confirmed", False):
         level = breakout.get("level")
         atr = h1.get("atr")
@@ -1408,7 +1615,6 @@ def build_trade_setup(spot, mtf, global_signal):
                 sell += 2
                 reasons_sell.append("Breakout Retest")
 
-    # ---------------- Candle Pattern ----------------
     pattern = h1.get("pattern") or {}
     pattern_direction = pattern.get("direction", "NONE")
     pattern_name = pattern.get("name", "NONE")
@@ -1420,7 +1626,6 @@ def build_trade_setup(spot, mtf, global_signal):
         sell += 1
         reasons_sell.append(pattern_name)
 
-    # ---------------- Support / Resistance proximity ----------------
     support = h1.get("support")
     resistance = h1.get("resistance")
     atr = h1.get("atr")
@@ -1437,7 +1642,6 @@ def build_trade_setup(spot, mtf, global_signal):
             sell += 2
             reasons_sell.append("Near Resistance")
 
-    # ---------------- Fibonacci ----------------
     nf = h1.get("nearest_fib")
     if nf and atr:
         fib_price = nf.get("price")
@@ -1452,7 +1656,6 @@ def build_trade_setup(spot, mtf, global_signal):
                 sell += 1
                 reasons_sell.append(f"Fib {fib_level}%")
 
-    # ---------------- RSI Divergence (ใหม่ - น้ำหนักสูง) ----------------
     divergence = h1.get("divergence") or {}
     if divergence.get("type") == "BULLISH_DIVERGENCE":
         weight = 2 + (divergence.get("strength", 0) / 10)
@@ -1463,7 +1666,6 @@ def build_trade_setup(spot, mtf, global_signal):
         sell += weight
         reasons_sell.append(f"RSI Bearish Divergence (strength {divergence.get('strength', 0)})")
 
-    # ---------------- Trend Strength (ใหม่) ----------------
     trend_strength = h1.get("trend_strength", 0)
     if trend_strength > 30:
         buy += 1
@@ -1472,7 +1674,6 @@ def build_trade_setup(spot, mtf, global_signal):
         sell += 1
         reasons_sell.append(f"Strong Downtrend ({trend_strength:.0f})")
 
-    # ---------------- Multi-timeframe alignment bonus ----------------
     if global_signal.get("aligned_timeframes", 0) >= 3:
         if global_signal.get("signal") == "BUY_BIAS":
             buy += 1.5
@@ -1481,17 +1682,14 @@ def build_trade_setup(spot, mtf, global_signal):
             sell += 1.5
             reasons_sell.append(f"{global_signal['aligned_timeframes']}/4 Timeframes Aligned")
 
-    # ---------------- Normalize เป็น % ของคะแนนเต็ม ----------------
     buy_percent = clamp((buy / MAX_RAW_SCORE) * 100, 0, 100)
     sell_percent = clamp((sell / MAX_RAW_SCORE) * 100, 0, 100)
 
-    # ---------------- Volatility filter ----------------
     atr_pct = h1.get("atr_percentile")
     volatility_ok = True
     if atr_pct is not None and atr_pct < MIN_ATR_PERCENTILE:
         volatility_ok = False
 
-    # ---------------- Final Direction ----------------
     direction = "NO_TRADE"
     score = max(buy, sell)
     score_percent = max(buy_percent, sell_percent)
@@ -1535,7 +1733,6 @@ def build_trade_setup(spot, mtf, global_signal):
         )
         direction = "NO_TRADE"
 
-    # ---------------- Risk (Entry / SL / TP) ----------------
     entry = price
     stop = None
     tp1 = None
@@ -1606,50 +1803,6 @@ def signal_quality(score_percent):
 
 
 # ============================================================
-# SIGNAL LOG
-# ============================================================
-
-def load_signal_log():
-    if not os.path.exists(SIGNAL_LOG_FILE):
-        return []
-    try:
-        with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def save_signal_log(data):
-    try:
-        with open(SIGNAL_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"SIGNAL LOG ERROR: {repr(e)}")
-
-
-def record_signal(spot, setup, global_signal):
-    log = load_signal_log()
-
-    log.append({
-        "time": now_thai().isoformat(),
-        "price": spot["price"],
-        "direction": setup.get("direction", "NO_TRADE"),
-        "score_percent": setup.get("score_percent", 0),
-        "buy_percent": setup.get("buy_percent", 0),
-        "sell_percent": setup.get("sell_percent", 0),
-        "entry": setup.get("entry"),
-        "stop": setup.get("stop"),
-        "tp1": setup.get("tp1"),
-        "tp2": setup.get("tp2"),
-        "global_signal": global_signal.get("signal", "NEUTRAL"),
-        "confidence": global_signal.get("confidence", 0),
-    })
-
-    log = log[-500:]
-    save_signal_log(log)
-
-
-# ============================================================
 # FULL ANALYSIS
 # ============================================================
 
@@ -1661,14 +1814,13 @@ def get_full_analysis():
     api_points = get_xau_intraday(hours=INTRADAY_HOURS)
     local_points = load_history_as_points()
 
-    # รวมข้อมูลจาก API กับข้อมูลที่บอทสะสมไว้เอง (local history)
-    # เพื่อให้ 4H timeframe (ต้องการ 120+ ชม.) พร้อมเร็วขึ้น แม้ API จะจำกัดชั่วโมงย้อนหลัง
+    # รวมข้อมูลจาก API กับข้อมูลที่บอทสะสมไว้เองใน Google Sheets
     points = merge_points(local_points, api_points)
 
     if len(points) < 30:
         raise RuntimeError(
             f"ข้อมูล Intraday ไม่พอ: {len(points)} จุด (ต้องการอย่างน้อย 30) "
-            f"- API ให้มา {len(api_points)} จุด, local history มี {len(local_points)} จุด"
+            f"- API ให้มา {len(api_points)} จุด, Google Sheets history มี {len(local_points)} จุด"
         )
 
     mtf = analyze_mtf(points)
@@ -2267,13 +2419,18 @@ async def status(interaction: discord.Interaction):
         elapsed_min = int((now_thai() - last_alert_time).total_seconds() / 60)
         last_alert_text = f"{last_alert_signal} เมื่อ {elapsed_min} นาทีที่แล้ว"
 
+    gs_status = "🟢 เชื่อมต่อแล้ว" if _gs_enabled else "🔴 ไม่ได้เชื่อมต่อ (ตั้งค่า ENV VARS)"
+
     await interaction.response.send_message(
         "🤖 **GOLD BOT V3 STATUS**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "🟢 Discord: ONLINE\n"
         "🟢 Render: RUNNING\n"
         "🟢 XAU API: READY\n"
-        "🟢 Smart Analysis Engine: READY\n\n"
+        "🟢 Smart Analysis Engine: READY\n"
+        f"📄 Google Sheets: {gs_status}\n"
+        f"   - Price rows (cache): `{len(_price_history_cache)}`\n"
+        f"   - Signal rows (cache): `{len(_signal_history_cache)}`\n\n"
         f"⏱️ Uptime: `{hours}h {minutes}m`\n"
         f"⏰ Monitor: ทุก `{CHECK_INTERVAL_MINUTES}` นาที\n"
         f"🔔 แจ้งเตือนล่าสุด: {last_alert_text}\n\n"
@@ -2282,7 +2439,7 @@ async def status(interaction: discord.Interaction):
 
 
 # ============================================================
-# /DIAGNOSE (ใหม่ใน V3 - debug ว่าทำไมไม่แจ้งเตือน)
+# /DIAGNOSE
 # ============================================================
 
 @bot.tree.command(name="diagnose", description="ดูรายละเอียดว่าทำไมรอบล่าสุดแจ้งเตือนหรือไม่")
@@ -2312,6 +2469,7 @@ async def diagnose(interaction: discord.Interaction):
         f"Confidence: `{snap.get('confidence', 0)}%`",
         f"ATR Percentile: `{fmt_percent(snap.get('atr_percentile'))}`",
         f"4H Timeframe พร้อมหรือยัง: `{'✅ พร้อม' if snap.get('h4_ready') else '⏳ กำลังสะสมข้อมูล'}`",
+        f"Google Sheets: `{'✅ เชื่อมต่อ' if _gs_enabled else '❌ ไม่ได้เชื่อมต่อ'}`",
         "",
         "**เกณฑ์ที่ตั้งไว้ตอนนี้:**",
         f"MIN_SIGNAL_PERCENT = `{MIN_SIGNAL_PERCENT}%`",
@@ -2350,7 +2508,7 @@ async def diagnose(interaction: discord.Interaction):
 
 
 # ============================================================
-# /CONFIG (ใหม่ใน V3)
+# /CONFIG
 # ============================================================
 
 @bot.tree.command(name="config", description="ดูค่า threshold ปัจจุบันของบอท")
@@ -2370,6 +2528,10 @@ async def config_cmd(interaction: discord.Interaction):
         f"`RE_ALERT_SCORE_INCREASE` = {RE_ALERT_SCORE_INCREASE}% "
         "(คะแนนต้องเพิ่มเท่านี้ถึงจะแจ้งซ้ำทิศทางเดิม)",
         f"`CHECK_INTERVAL_MINUTES` = {CHECK_INTERVAL_MINUTES} นาที",
+        "",
+        f"`GOOGLE_SHEET_ID` = `{'ตั้งค่าแล้ว' if GOOGLE_SHEET_ID else 'ยังไม่ได้ตั้งค่า'}`",
+        f"`GOOGLE_SERVICE_ACCOUNT_JSON` = `{'ตั้งค่าแล้ว' if GOOGLE_SERVICE_ACCOUNT_JSON else 'ยังไม่ได้ตั้งค่า'}`",
+        f"Google Sheets connection: `{'✅ เชื่อมต่อ' if _gs_enabled else '❌ ไม่ได้เชื่อมต่อ'}`",
         "",
         "💡 ถ้าอยากให้บอทแจ้งเตือนถี่ขึ้น ลองลด "
         "`MIN_SIGNAL_PERCENT`, `MIN_CONFIDENCE` หรือ `DIRECTION_MARGIN_PERCENT` "
@@ -2396,7 +2558,7 @@ async def help_command(interaction: discord.Interaction):
         "`/levels` Support / Resistance / Fibonacci\n"
         "`/pattern` Candlestick Pattern\n"
         "`/chart` กราฟ XAU/USD + EMA\n"
-        "`/status` สถานะระบบ\n"
+        "`/status` สถานะระบบ (รวม Google Sheets)\n"
         "`/diagnose` ดูว่าทำไมรอบล่าสุดแจ้งเตือนหรือไม่\n"
         "`/config` ดูค่า threshold ปัจจุบัน\n"
         "`/help` คำสั่งทั้งหมด\n\n"
@@ -2407,19 +2569,20 @@ async def help_command(interaction: discord.Interaction):
         "🚀 Breakout / Retest\n"
         "🕯️ Candlestick (+ Doji, Star)\n"
         "📐 Fibonacci\n"
-        "🔀 RSI Divergence (ใหม่)\n"
-        "📈 Trend Strength Regression (ใหม่)\n"
-        "📉 Volatility Filter (ใหม่)\n"
+        "🔀 RSI Divergence\n"
+        "📈 Trend Strength Regression\n"
+        "📉 Volatility Filter\n"
         "⭐ Normalized Confluence Score %\n"
         "🛡️ SL / TP / R:R\n"
-        "🔔 Smart Re-Alert Logic (ใหม่)"
+        "🔔 Smart Re-Alert Logic\n"
+        "📄 Google Sheets Persistence (ข้อมูลไม่หายเมื่อ Render restart)"
     )
 
     await interaction.response.send_message(message)
 
 
 # ============================================================
-# MONITOR LOOP (แก้ไขจุดที่ทำให้ไม่แจ้งเตือน)
+# MONITOR LOOP
 # ============================================================
 
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
@@ -2434,14 +2597,13 @@ async def monitor_gold():
         spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
 
         price = spot["price"]
-        append_history(price)
+        await asyncio.to_thread(append_history, price)
 
         direction = setup.get("direction", "NO_TRADE")
         score_percent = setup.get("score_percent", 0)
         confidence = global_signal.get("confidence", 0)
         h1 = mtf.get("1H", {})
 
-        # --- เก็บ snapshot ไว้ debug ผ่าน /diagnose และ /debug ---
         last_analysis_snapshot = {
             "time": now_thai().isoformat(),
             "price": price,
@@ -2455,7 +2617,6 @@ async def monitor_gold():
             "h4_ready": setup.get("h4_ready"),
         }
 
-        # --- log ให้เห็นชัดทุกรอบ (สำคัญมากสำหรับ debug ว่าทำไมไม่แจ้งเตือน) ---
         logger.info(f"PRICE: {price:.2f}")
         logger.info(f"BIAS: {global_signal.get('signal')}  | CONFIDENCE: {confidence}%")
         logger.info(
@@ -2473,9 +2634,6 @@ async def monitor_gold():
 
         last_price = price
 
-        # ------------------------------------------------------
-        # เงื่อนไขแจ้งเตือนพื้นฐาน
-        # ------------------------------------------------------
         if direction not in ("BUY", "SELL"):
             logger.info("ไม่แจ้งเตือน: direction = NO_TRADE")
             return
@@ -2492,12 +2650,6 @@ async def monitor_gold():
             logger.info("ไม่แจ้งเตือน: volatility ต่ำเกินไป (ตลาด sideways)")
             return
 
-        # ------------------------------------------------------
-        # Cooldown + Re-alert logic (จุดที่แก้จาก V2)
-        # V2: ถ้าทิศทางเดิม -> skip ตลอดจนกว่าจะเปลี่ยนทิศทาง (ทำให้เงียบยาวเกินไป)
-        # V3: อนุญาตแจ้งซ้ำทิศทางเดิมได้ ถ้า cooldown หมด "และ"
-        #     คะแนนแข็งแกร่งขึ้นชัดเจน (RE_ALERT_SCORE_INCREASE)
-        # ------------------------------------------------------
         current_time = now_thai()
         is_re_alert = False
 
@@ -2545,7 +2697,7 @@ async def monitor_gold():
         if message:
             await channel.send(message)
 
-            record_signal(spot, setup, global_signal)
+            await asyncio.to_thread(record_signal, spot, setup, global_signal)
 
             last_alert_time = current_time
             last_alert_signal = direction
@@ -2594,11 +2746,16 @@ async def on_ready():
 
 async def main():
     logger.info("=" * 70)
-    logger.info("STARTING XAU/USD GOLD DISCORD BOT V3 - SMART ANALYSIS EDITION")
+    logger.info("STARTING XAU/USD GOLD DISCORD BOT V3 - SMART ANALYSIS EDITION (Google Sheets)")
     logger.info("=" * 70)
 
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not configured")
+
+    # เชื่อมต่อ Google Sheets และโหลด cache ก่อนเริ่ม bot / web server
+    await asyncio.to_thread(init_google_sheets)
+    await asyncio.to_thread(load_price_history_cache_from_sheet)
+    await asyncio.to_thread(load_signal_history_cache_from_sheet)
 
     await start_web_server()
 
