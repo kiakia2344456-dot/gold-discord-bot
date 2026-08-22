@@ -37,6 +37,14 @@ from gspread.exceptions import WorksheetNotFound, APIError
 # - ใช้ in-memory cache กัน read เต็มชีทถี่เกินไป (อ่านเต็มชีทแค่ตอน start
 #   แล้ว append ทีละแถวหลังจากนั้น)
 #
+# PATCH (แก้ปัญหา Render แบนเพราะยิง API รัวตอนตลาดปิด/API ล่ม):
+# - เพิ่ม CIRCUIT BREAKER: ถ้า external API (xaus.com) fail ติดกันเกิน threshold
+#   จะ "เปิดวงจร" หยุดยิง API ไปชั่วคราว (cooldown) ไม่ว่าจะถูกเรียกจาก
+#   monitor loop หรือ slash command ไหนก็ตาม
+# - เพิ่ม SHARED ANALYSIS CACHE: ผลวิเคราะห์ (get_full_analysis) จะถูกแคชไว้
+#   สั้นๆ (ค่าเริ่มต้น 30 วิ) กันหลาย slash command / monitor loop ยิงซ้ำ
+#   พร้อมกันในเวลาใกล้เคียงกันโดยไม่จำเป็น
+#
 # ต้องเพิ่ม ENV VARS ใหม่ (ดูหัวข้อ CONFIG ด้านล่าง):
 #   GOOGLE_SERVICE_ACCOUNT_JSON  -> เนื้อหาไฟล์ service account JSON ทั้งไฟล์ (string)
 #   GOOGLE_SHEET_ID              -> ID ของ Google Sheet (จาก URL)
@@ -160,6 +168,13 @@ HEARTBEAT_MINUTES = env_int("HEARTBEAT_MINUTES", 0)
 HTTP_MAX_RETRIES = env_int("HTTP_MAX_RETRIES", 3)
 HTTP_BACKOFF_BASE = env_float("HTTP_BACKOFF_BASE", 1.5)
 
+# --- Circuit breaker (กันยิง API รัวตอน API ล่มต่อเนื่อง เช่นตลาดปิด) ---
+CIRCUIT_FAIL_THRESHOLD = env_int("CIRCUIT_FAIL_THRESHOLD", 3)
+CIRCUIT_COOLDOWN_MINUTES = env_int("CIRCUIT_COOLDOWN_MINUTES", 15)
+
+# --- Shared analysis cache (กันหลายจุดยิง API ซ้ำพร้อมกันโดยไม่จำเป็น) ---
+ANALYSIS_CACHE_SECONDS = env_int("ANALYSIS_CACHE_SECONDS", 30)
+
 # --- Google Sheets (แทนที่ local JSON file) ---
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -186,6 +201,75 @@ last_alert_score_percent = 0.0
 last_price = None
 last_analysis_snapshot = None
 bot_start_time = datetime.now(TZ)
+
+
+# ============================================================
+# CIRCUIT BREAKER
+# ============================================================
+#
+# แนวคิด:
+# - นับจำนวนครั้งที่ยิง external API (xaus.com) แล้ว fail ติดต่อกัน
+#   (นับรวมทั้ง spot และ intraday endpoint เป็นตัวเดียวกัน)
+# - ถ้า fail ติดกันครบ CIRCUIT_FAIL_THRESHOLD ครั้ง -> "เปิดวงจร"
+#   หยุดยิง API ไปจนถึงเวลาที่กำหนด (CIRCUIT_COOLDOWN_MINUTES)
+# - ระหว่างวงจรเปิด ทุกจุดที่เรียก get_xau_spot / get_xau_intraday
+#   (ไม่ว่าจะจาก monitor loop หรือ slash command ไหน) จะได้ None / []
+#   ทันทีโดยไม่ยิง HTTP request ออกไปเลย -> ตัดปัญหายิงรัวตอน API ล่ม
+# - พอยิงสำเร็จอีกครั้ง (หลัง cooldown หมด) วงจรจะปิดกลับสู่ปกติทันที
+# ============================================================
+
+_circuit_fail_count = 0
+_circuit_open_until = None
+
+
+def circuit_is_open():
+    """True ถ้าวงจรเปิดอยู่ (ยังไม่ควรยิง API)"""
+    global _circuit_open_until
+
+    if _circuit_open_until is not None and now_thai() < _circuit_open_until:
+        return True
+
+    if _circuit_open_until is not None and now_thai() >= _circuit_open_until:
+        # หมด cooldown แล้ว -> ปิดวงจร ให้ลองยิงใหม่ได้อีกครั้ง
+        logger.info("CIRCUIT: cooldown หมดแล้ว ลองยิง API ใหม่อีกครั้ง")
+        _circuit_open_until = None
+
+    return False
+
+
+def circuit_record_failure():
+    """เรียกทุกครั้งที่ยิง API แล้ว fail"""
+    global _circuit_fail_count, _circuit_open_until
+
+    _circuit_fail_count += 1
+    logger.warning(
+        f"CIRCUIT: fail ติดกันครั้งที่ {_circuit_fail_count}/{CIRCUIT_FAIL_THRESHOLD}"
+    )
+
+    if _circuit_fail_count >= CIRCUIT_FAIL_THRESHOLD and _circuit_open_until is None:
+        _circuit_open_until = now_thai() + timedelta(minutes=CIRCUIT_COOLDOWN_MINUTES)
+        logger.warning(
+            f"CIRCUIT OPEN: หยุดยิง API ชั่วคราว (อาจเป็นเพราะตลาดปิดหรือ API ล่ม) "
+            f"จะลองใหม่หลัง {_circuit_open_until.strftime('%H:%M:%S')}"
+        )
+
+
+def circuit_record_success():
+    """เรียกทุกครั้งที่ยิง API สำเร็จ -> reset วงจรกลับปกติ"""
+    global _circuit_fail_count, _circuit_open_until
+
+    if _circuit_fail_count > 0 or _circuit_open_until is not None:
+        logger.info("CIRCUIT: API กลับมาใช้ได้ปกติ รีเซ็ตวงจร")
+
+    _circuit_fail_count = 0
+    _circuit_open_until = None
+
+
+def circuit_status_text():
+    if circuit_is_open():
+        remaining = (_circuit_open_until - now_thai()).total_seconds() / 60
+        return f"🔴 OPEN (เหลืออีก {remaining:.0f} นาที)"
+    return "🟢 CLOSED (ปกติ)"
 
 
 # ============================================================
@@ -619,6 +703,7 @@ async def handle_health_check(request):
         "service": "XAU/USD Discord Bot V3 - Smart Analysis (Google Sheets)",
         "time": now_thai().isoformat(),
         "google_sheets": _gs_enabled,
+        "circuit_breaker": circuit_status_text(),
     })
 
 
@@ -632,6 +717,8 @@ async def handle_diagnostics(request):
         "google_sheets_enabled": _gs_enabled,
         "price_history_rows_cached": len(_price_history_cache),
         "signal_history_rows_cached": len(_signal_history_cache),
+        "circuit_breaker_status": circuit_status_text(),
+        "circuit_fail_count": _circuit_fail_count,
         "config": {
             "MIN_SIGNAL_PERCENT": MIN_SIGNAL_PERCENT,
             "MIN_CONFIDENCE": MIN_CONFIDENCE,
@@ -639,6 +726,9 @@ async def handle_diagnostics(request):
             "MIN_ATR_PERCENTILE": MIN_ATR_PERCENTILE,
             "ALERT_COOLDOWN_MINUTES": ALERT_COOLDOWN_MINUTES,
             "RE_ALERT_SCORE_INCREASE": RE_ALERT_SCORE_INCREASE,
+            "CIRCUIT_FAIL_THRESHOLD": CIRCUIT_FAIL_THRESHOLD,
+            "CIRCUIT_COOLDOWN_MINUTES": CIRCUIT_COOLDOWN_MINUTES,
+            "ANALYSIS_CACHE_SECONDS": ANALYSIS_CACHE_SECONDS,
         }
     })
 
@@ -674,6 +764,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ============================================================
 
 def get_xau_spot():
+    if circuit_is_open():
+        logger.info("ข้าม SPOT fetch: circuit breaker เปิดอยู่ (API มีปัญหาต่อเนื่อง)")
+        return None
+
     try:
         cache_buster = int(datetime.now().timestamp())
 
@@ -693,6 +787,8 @@ def get_xau_spot():
         if price is None:
             raise ValueError(f"ไม่พบ spot_usd_oz: {data}")
 
+        circuit_record_success()
+
         return {
             "price": price,
             "updated_at": data.get("updated_at"),
@@ -702,6 +798,7 @@ def get_xau_spot():
         }
 
     except Exception as e:
+        circuit_record_failure()
         logger.error(f"XAU SPOT ERROR: {repr(e)}")
         return None
 
@@ -711,6 +808,10 @@ def get_xau_spot():
 # ============================================================
 
 def get_xau_intraday(hours=48):
+    if circuit_is_open():
+        logger.info("ข้าม INTRADAY fetch: circuit breaker เปิดอยู่ (API มีปัญหาต่อเนื่อง)")
+        return []
+
     try:
         data = http_get_json(
             XAU_INTRADAY_URL,
@@ -743,9 +844,11 @@ def get_xau_intraday(hours=48):
                 continue
 
         points.sort(key=lambda x: x["time"])
+        circuit_record_success()
         return points
 
     except Exception as e:
+        circuit_record_failure()
         logger.error(f"XAU INTRADAY ERROR: {repr(e)}")
         return []
 
@@ -1809,6 +1912,11 @@ def signal_quality(score_percent):
 def get_full_analysis():
     spot = get_xau_spot()
     if spot is None:
+        if circuit_is_open():
+            raise RuntimeError(
+                "API XAU/USD กำลังมีปัญหาต่อเนื่อง (circuit breaker เปิดอยู่) "
+                "ระบบพักการยิง API ชั่วคราวเพื่อไม่ให้โดนแบน ลองใหม่อีกครั้งภายหลัง"
+            )
         raise RuntimeError("ไม่สามารถดึง XAU/USD Spot ได้ (API อาจล่มชั่วคราว ลองใหม่รอบถัดไป)")
 
     api_points = get_xau_intraday(hours=INTRADAY_HOURS)
@@ -1828,6 +1936,61 @@ def get_full_analysis():
     setup = build_trade_setup(spot, mtf, global_signal)
 
     return spot, points, mtf, global_signal, setup
+
+
+# ============================================================
+# SHARED ANALYSIS CACHE
+# ============================================================
+#
+# แนวคิด:
+# - get_full_analysis() ยิง API จริงทุกครั้งที่ถูกเรียก
+# - แต่ทุก slash command (/xau /analysis /signal /trend /levels /pattern)
+#   และ monitor loop เรียกฟังก์ชันนี้แยกกัน ถ้ามีคนกดคำสั่งพร้อมกันหลายคน
+#   หรือ monitor loop กำลังรันพอดี จะกลายเป็นยิง API ซ้ำซ้อนโดยไม่จำเป็น
+#   เพราะข้อมูลในช่วงเวลาสั้นๆ ไม่ต่างกันอยู่แล้ว
+# - get_full_analysis_cached() แคชผลลัพธ์ไว้ ANALYSIS_CACHE_SECONDS วินาที
+#   ถ้ามีการเรียกซ้ำในช่วงเวลานั้น จะคืนผลจาก cache แทนที่จะยิง API ใหม่
+# - ใช้ asyncio.Lock กันกรณีมีหลาย request เข้ามาพร้อมกันตอน cache หมดอายุ
+#   พอดี (กันยิง API ซ้อนกันหลายครั้งในจังหวะเดียวกัน)
+# ============================================================
+
+_analysis_cache_lock = asyncio.Lock()
+_analysis_cache_result = None
+_analysis_cache_time = None
+_analysis_cache_error = None
+
+
+async def get_full_analysis_cached():
+    """ใช้แทน get_full_analysis() ตรงๆ ในทุก slash command และ monitor loop"""
+    global _analysis_cache_result, _analysis_cache_time, _analysis_cache_error
+
+    async with _analysis_cache_lock:
+        now = now_thai()
+
+        cache_fresh = (
+            _analysis_cache_time is not None
+            and (now - _analysis_cache_time).total_seconds() < ANALYSIS_CACHE_SECONDS
+        )
+
+        if cache_fresh and _analysis_cache_result is not None:
+            return _analysis_cache_result
+
+        if cache_fresh and _analysis_cache_error is not None:
+            # เพิ่งยิงพลาดไปเมื่อกี้นี้เอง (ยังอยู่ในช่วง cache) -> ไม่ยิงซ้ำ
+            # โยน error เดิมออกไปแทน กันการยิงรัวตอน error ต่อเนื่อง
+            raise _analysis_cache_error
+
+        try:
+            result = await asyncio.to_thread(get_full_analysis)
+            _analysis_cache_result = result
+            _analysis_cache_error = None
+            _analysis_cache_time = now
+            return result
+        except Exception as e:
+            _analysis_cache_result = None
+            _analysis_cache_error = e
+            _analysis_cache_time = now
+            raise
 
 
 # ============================================================
@@ -2133,7 +2296,13 @@ async def gold(interaction: discord.Interaction):
         spot = await asyncio.to_thread(get_xau_spot)
 
         if spot is None:
-            await interaction.followup.send("❌ ไม่สามารถดึงราคา XAU/USD ได้ (API อาจล่มชั่วคราว)")
+            if circuit_is_open():
+                await interaction.followup.send(
+                    f"❌ API XAU/USD กำลังมีปัญหาต่อเนื่อง ระบบพักการยิง API ชั่วคราว\n"
+                    f"สถานะ: {circuit_status_text()}"
+                )
+            else:
+                await interaction.followup.send("❌ ไม่สามารถดึงราคา XAU/USD ได้ (API อาจล่มชั่วคราว)")
             return
 
         state = spot.get("data_state", {}) or {}
@@ -2161,7 +2330,7 @@ async def xau(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
+        spot, points, mtf, global_signal, setup = await get_full_analysis_cached()
         message = build_analysis_message(spot, mtf, global_signal, setup)
         await interaction.followup.send(message)
 
@@ -2180,7 +2349,7 @@ async def analysis(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
+        spot, points, mtf, global_signal, setup = await get_full_analysis_cached()
         await interaction.followup.send(build_analysis_message(spot, mtf, global_signal, setup))
 
     except Exception as e:
@@ -2197,7 +2366,7 @@ async def signal(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
+        spot, points, mtf, global_signal, setup = await get_full_analysis_cached()
         direction = setup.get("direction", "NO_TRADE")
 
         if direction == "BUY":
@@ -2256,7 +2425,7 @@ async def trend(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
+        spot, points, mtf, global_signal, setup = await get_full_analysis_cached()
 
         lines = [
             "📊 **XAU/USD TREND V3**",
@@ -2301,7 +2470,7 @@ async def levels(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
+        spot, points, mtf, global_signal, setup = await get_full_analysis_cached()
 
         h1 = mtf.get("1H", {})
 
@@ -2354,7 +2523,7 @@ async def pattern(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
+        spot, points, mtf, global_signal, setup = await get_full_analysis_cached()
 
         lines = ["🕯️ **XAU/USD CANDLE PATTERN**", "━━━━━━━━━━━━━━━━━━", ""]
 
@@ -2430,7 +2599,8 @@ async def status(interaction: discord.Interaction):
         "🟢 Smart Analysis Engine: READY\n"
         f"📄 Google Sheets: {gs_status}\n"
         f"   - Price rows (cache): `{len(_price_history_cache)}`\n"
-        f"   - Signal rows (cache): `{len(_signal_history_cache)}`\n\n"
+        f"   - Signal rows (cache): `{len(_signal_history_cache)}`\n"
+        f"🛡️ Circuit Breaker: {circuit_status_text()}\n\n"
         f"⏱️ Uptime: `{hours}h {minutes}m`\n"
         f"⏰ Monitor: ทุก `{CHECK_INTERVAL_MINUTES}` นาที\n"
         f"🔔 แจ้งเตือนล่าสุด: {last_alert_text}\n\n"
@@ -2470,6 +2640,7 @@ async def diagnose(interaction: discord.Interaction):
         f"ATR Percentile: `{fmt_percent(snap.get('atr_percentile'))}`",
         f"4H Timeframe พร้อมหรือยัง: `{'✅ พร้อม' if snap.get('h4_ready') else '⏳ กำลังสะสมข้อมูล'}`",
         f"Google Sheets: `{'✅ เชื่อมต่อ' if _gs_enabled else '❌ ไม่ได้เชื่อมต่อ'}`",
+        f"Circuit Breaker: {circuit_status_text()}",
         "",
         "**เกณฑ์ที่ตั้งไว้ตอนนี้:**",
         f"MIN_SIGNAL_PERCENT = `{MIN_SIGNAL_PERCENT}%`",
@@ -2477,6 +2648,8 @@ async def diagnose(interaction: discord.Interaction):
         f"DIRECTION_MARGIN_PERCENT = `{DIRECTION_MARGIN_PERCENT}%`",
         f"MIN_ATR_PERCENTILE = `{MIN_ATR_PERCENTILE}%`",
         f"ALERT_COOLDOWN_MINUTES = `{ALERT_COOLDOWN_MINUTES}`",
+        f"CIRCUIT_FAIL_THRESHOLD = `{CIRCUIT_FAIL_THRESHOLD}` ครั้ง",
+        f"CIRCUIT_COOLDOWN_MINUTES = `{CIRCUIT_COOLDOWN_MINUTES}` นาที",
         "",
     ]
 
@@ -2529,6 +2702,14 @@ async def config_cmd(interaction: discord.Interaction):
         "(คะแนนต้องเพิ่มเท่านี้ถึงจะแจ้งซ้ำทิศทางเดิม)",
         f"`CHECK_INTERVAL_MINUTES` = {CHECK_INTERVAL_MINUTES} นาที",
         "",
+        f"`CIRCUIT_FAIL_THRESHOLD` = {CIRCUIT_FAIL_THRESHOLD} ครั้ง "
+        "(fail ติดกันกี่ครั้งถึงจะหยุดยิง API ชั่วคราว)",
+        f"`CIRCUIT_COOLDOWN_MINUTES` = {CIRCUIT_COOLDOWN_MINUTES} นาที "
+        "(หยุดยิง API นานแค่ไหนก่อนลองใหม่)",
+        f"`ANALYSIS_CACHE_SECONDS` = {ANALYSIS_CACHE_SECONDS} วิ "
+        "(แคชผลวิเคราะห์กันหลายคำสั่ง/monitor ยิงซ้อนกัน)",
+        f"Circuit Breaker ปัจจุบัน: {circuit_status_text()}",
+        "",
         f"`GOOGLE_SHEET_ID` = `{'ตั้งค่าแล้ว' if GOOGLE_SHEET_ID else 'ยังไม่ได้ตั้งค่า'}`",
         f"`GOOGLE_SERVICE_ACCOUNT_JSON` = `{'ตั้งค่าแล้ว' if GOOGLE_SERVICE_ACCOUNT_JSON else 'ยังไม่ได้ตั้งค่า'}`",
         f"Google Sheets connection: `{'✅ เชื่อมต่อ' if _gs_enabled else '❌ ไม่ได้เชื่อมต่อ'}`",
@@ -2558,7 +2739,7 @@ async def help_command(interaction: discord.Interaction):
         "`/levels` Support / Resistance / Fibonacci\n"
         "`/pattern` Candlestick Pattern\n"
         "`/chart` กราฟ XAU/USD + EMA\n"
-        "`/status` สถานะระบบ (รวม Google Sheets)\n"
+        "`/status` สถานะระบบ (รวม Google Sheets + Circuit Breaker)\n"
         "`/diagnose` ดูว่าทำไมรอบล่าสุดแจ้งเตือนหรือไม่\n"
         "`/config` ดูค่า threshold ปัจจุบัน\n"
         "`/help` คำสั่งทั้งหมด\n\n"
@@ -2575,7 +2756,8 @@ async def help_command(interaction: discord.Interaction):
         "⭐ Normalized Confluence Score %\n"
         "🛡️ SL / TP / R:R\n"
         "🔔 Smart Re-Alert Logic\n"
-        "📄 Google Sheets Persistence (ข้อมูลไม่หายเมื่อ Render restart)"
+        "📄 Google Sheets Persistence (ข้อมูลไม่หายเมื่อ Render restart)\n"
+        "🧯 Circuit Breaker (กันโดน Render แบนตอน API ล่ม/ตลาดปิด)"
     )
 
     await interaction.response.send_message(message)
@@ -2594,7 +2776,11 @@ async def monitor_gold():
         logger.info("=" * 60)
         logger.info(f"[{now_thai().strftime('%Y-%m-%d %H:%M:%S')}] XAU/USD V3 CHECK เริ่มรอบตรวจสอบ")
 
-        spot, points, mtf, global_signal, setup = await asyncio.to_thread(get_full_analysis)
+        if circuit_is_open():
+            logger.info(f"ข้ามรอบนี้: circuit breaker เปิดอยู่ ({circuit_status_text()})")
+            return
+
+        spot, points, mtf, global_signal, setup = await get_full_analysis_cached()
 
         price = spot["price"]
         await asyncio.to_thread(append_history, price)
